@@ -175,6 +175,7 @@ from .utils import (
 from .utils.import_utils import requires
 from .utils.quantization_config import QuantizationMethod
 
+from perforatedai import globals_perforatedai as GPA
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -398,6 +399,7 @@ class Trainer:
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        using_perforatedai: bool = False,
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -422,6 +424,11 @@ class Trainer:
 
         self.args = args
         self.compute_loss_func = compute_loss_func
+        self.using_perforatedai = using_perforatedai
+        
+        # When using PerforatedAI, disable automatic saving to avoid conflicts
+        if self.using_perforatedai:
+            self.args.save_strategy = SaveStrategy.NO
         # Seed must be set before instantiating the model when using model
         enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
 
@@ -652,9 +659,9 @@ class Trainer:
             # Set trainer reference for JIT callback after initialization
             jit_callback.set_trainer(self)
 
-        callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
+        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
         self.callback_handler = CallbackHandler(
-            callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+            self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
@@ -2266,6 +2273,14 @@ class Trainer:
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
 
+        # When using PerforatedAI, override max_steps to allow continuous evaluation
+        # beyond num_train_epochs. Otherwise callbacks stop triggering after the
+        # original max_steps threshold, causing validation to flatline.
+        if self.using_perforatedai:
+            original_max_steps = max_steps
+            max_steps = num_update_steps_per_epoch * 100000000  # Effectively infinite
+            print(f"DEBUG: PAI enabled - overriding max_steps from {original_max_steps} to {max_steps} to allow continuous evaluation")
+
         if DebugOption.UNDERFLOW_OVERFLOW in self.args.debug:
             if self.args.n_gpu > 1:
                 # nn.DataParallel(model) replicates the model, creating new variables and module
@@ -2292,6 +2307,7 @@ class Trainer:
             self.optimizer, self.lr_scheduler = deepspeed_init(self, num_training_steps=max_steps)
 
         if not delay_optimizer_creation:
+            self.max_steps = max_steps
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         self.state = TrainerState(
@@ -2327,6 +2343,7 @@ class Trainer:
                 self._fsdp_qlora_plugin_updates()
                 if self.accelerator.mixed_precision != "fp8":
                     self.model = self.accelerator.prepare(self.model)
+            self.max_steps = max_steps
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
         # prepare using `accelerator` prepare
@@ -2424,6 +2441,7 @@ class Trainer:
         for attr in ("model", "optimizer", "lr_scheduler"):
             setattr(self.callback_handler, attr, getattr(self, attr))
         self.callback_handler.train_dataloader = train_dataloader
+        self._train_dataloader = train_dataloader  # Store for access after restructuring
 
         self.state.init_training_references(self, max_steps, num_train_epochs, trial)
 
@@ -2440,7 +2458,9 @@ class Trainer:
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
-        for epoch in range(epochs_trained, num_train_epochs):
+        if self.using_perforatedai:
+            GPA.pai_tracker.set_optimizer_instance(self.optimizer)
+        for epoch in range(epochs_trained, 100000000 if self.using_perforatedai else num_train_epochs):
             epoch_dataloader = train_dataloader
 
             steps_in_epoch = (
@@ -2451,6 +2471,7 @@ class Trainer:
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
             step = -1
+            trainingComplete = False
             rng_to_sync = False
 
             # Handle resumption from checkpoint
@@ -2592,6 +2613,20 @@ class Trainer:
 
                         self.control = self.callback_handler.on_optimizer_step(args, self.state, self.control)
 
+                        # Check for NaN gradients
+                        if grad_norm is not None and (torch.isnan(torch.tensor(grad_norm)) if not isinstance(grad_norm, torch.Tensor) else torch.isnan(grad_norm)):
+                            logger.warning(
+                                "\n" + "="*80 + "\n"
+                                f"⚠️  WARNING: NaN GRADIENT DETECTED at step {self.state.global_step}, epoch {epoch + (step + 1) / steps_in_epoch:.2f}\n"
+                                "⚠️  This will cause model corruption and unreliable training!\n"
+                                "⚠️  Common causes:\n"
+                                "⚠️    1. Learning rate too high\n"
+                                "⚠️    2. Numerical instability in the model\n"
+                                "⚠️    3. Issues with input data (extreme values, inf, NaN)\n"
+                                "⚠️  Try: lower learning rate, add gradient clipping (--max_grad_norm 1.0), or check your data.\n"
+                                + "="*80
+                            )
+
                         # get leaning rate before update
                         learning_rate = self._get_learning_rate()
 
@@ -2604,7 +2639,7 @@ class Trainer:
                         self.state.global_step += 1
                         self.state.epoch = epoch + (step + 1) / steps_in_epoch
                         self.control = self.callback_handler.on_step_end(args, self.state, self.control)
-                        self._maybe_log_save_evaluate(
+                        model, trainingComplete = self._maybe_log_save_evaluate(
                             tr_loss,
                             grad_norm,
                             model,
@@ -2620,12 +2655,12 @@ class Trainer:
                     # PyTorch/XLA relies on the data loader to insert the mark_step for
                     # each step. Since we are breaking the loop early, we need to manually
                     # insert the mark_step here.
-                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                    if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                         if is_torch_xla_available():
                             xm.mark_step()
                         break
                 # We also need to break out of the nested loop
-                if self.control.should_epoch_stop or self.control.should_training_stop:
+                if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
@@ -2638,9 +2673,14 @@ class Trainer:
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(
+            model, trainingComplete_new = self._maybe_log_save_evaluate(
                 tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=learning_rate
             )
+            # Preserve trainingComplete if it was already set to True
+            trainingComplete = trainingComplete or trainingComplete_new
+            
+            # Ensure model is in training mode after evaluation
+            model.train()
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_xla_available():
@@ -2651,7 +2691,7 @@ class Trainer:
                         "You enabled PyTorch/XLA debug metrics but you don't have a TPU "
                         "configured. Check your training configuration if this is unexpected."
                     )
-            if self.control.should_training_stop:
+            if trainingComplete or ((not self.using_perforatedai) and self.control.should_training_stop):
                 break
 
         logger.info("\n\nTraining completed. Do not forget to share your model on huggingface.co/models =)\n\n")
@@ -2990,7 +3030,9 @@ class Trainer:
         self, tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time, learning_rate=None
     ):
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            
             if is_torch_xla_available():
+                #PERFORATED THIS USED TO BE COMMENTED OUT, if crashing do again
                 xm.mark_step()
 
             logs: dict[str, float] = {}
@@ -3016,8 +3058,96 @@ class Trainer:
             self.log(logs, start_time)
 
         metrics = None
+        trainingComplete = False
         if self.control.should_evaluate:
             metrics = self._evaluate(trial, ignore_keys_for_eval)
+
+            # Check for NaN in evaluation metrics
+            eval_loss = metrics.get('eval_loss')
+            if eval_loss is not None and (torch.isnan(torch.tensor(eval_loss)) if not isinstance(eval_loss, torch.Tensor) else torch.isnan(eval_loss)):
+                logger.warning(
+                    "\n" + "="*80 + "\n"
+                    f"⚠️  WARNING: NaN EVAL_LOSS DETECTED at step {self.state.global_step}, epoch {self.state.epoch:.2f}\n"
+                    "⚠️  The model has become corrupted (likely from earlier NaN gradients)!\n"
+                    "⚠️  Training metrics may appear to improve but the model is BROKEN.\n"
+                    "⚠️  Try: lower learning rate, add gradient clipping (--max_grad_norm 1.0), check for data issues.\n"
+                    + "="*80
+                )
+            
+            if self.using_perforatedai:
+                # Get metric values
+                eval_accuracy = metrics.get('eval_accuracy')
+                eval_loss = metrics.get('eval_loss')
+                train_loss_avg = self._total_loss_scalar / self.state.global_step if self.state.global_step > 0 else 0
+                
+                
+                # Map score names to their values and labels
+                score_map = {
+                    'eval_accuracy': (eval_accuracy, 'Eval Accuracy'),
+                    'eval_loss': (eval_loss, 'Eval Loss'),
+                    'train_loss': (train_loss_avg, 'Train Loss')
+                }
+                
+                extra_scores = GPA.pc.get_library_extra_scores()
+                
+                # Process extra scores (without validation score)
+                for score_name in GPA.pc.get_library_extra_scores() + GPA.pc.get_library_extra_scores_without_graphing():
+                    if score_name not in score_map:
+                        continue
+                    
+                    score_value, score_label = score_map[score_name]
+                    if score_value is None:
+                        continue
+                    
+                    if score_name in GPA.pc.get_library_extra_scores():
+                        GPA.pai_tracker.add_extra_score(score_value, score_label)
+                    if score_name in GPA.pc.get_library_extra_scores_without_graphing():
+                        GPA.pai_tracker.add_extra_score_without_graphing(score_value, score_label)
+                
+                # Call add_validation_score last, after all extra scores are processed
+                validation_score_name = GPA.pc.get_library_validation_score()
+                if validation_score_name in score_map:
+                    score_value, score_label = score_map[validation_score_name]
+                    if score_value is not None:
+                        self.model, restructured, trainingComplete = GPA.pai_tracker.add_validation_score(score_value, model)
+                    else:
+                        restructured = False
+                        trainingComplete = False
+                else:
+                    restructured = False
+                    trainingComplete = False
+
+                model = self.model
+                if(restructured):
+                    self._move_model_to_device(self.model, self.args.device)
+                    self.optimizer = None
+                    self.lr_scheduler = None
+                    self.create_optimizer_and_scheduler(num_training_steps=self.max_steps)
+                    self.callback_handler.optimizer = self.optimizer
+                    self.callback_handler = CallbackHandler(
+                        self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+                    )
+                    # Set train_dataloader for progress callback
+                    if hasattr(self, '_train_dataloader'):
+                        self.callback_handler.train_dataloader = self._train_dataloader
+                    if hasattr(self.lr_scheduler, "step"):
+                        if self.args.optim == OptimizerNames.ADAMW_APEX_FUSED:
+                            model = self.accelerator.prepare(self.model)
+                        else:
+                            model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+                    else:
+                        # to handle cases wherein we pass "DummyScheduler" such as when it is specified in DeepSpeed config.
+                        model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                            self.model, self.optimizer, self.lr_scheduler
+                        )
+
+
+                    GPA.pai_tracker.set_optimizer_instance(self.optimizer)
+                
+                self.model.train()
+                self.model_wrapped = self.model
+                self.callback_handler.model = self.model
+
             is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
 
             if self.args.save_strategy == SaveStrategy.BEST:
@@ -3026,6 +3156,8 @@ class Trainer:
         if self.control.should_save:
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
+        return model, trainingComplete
 
     def _load_rng_state(self, checkpoint):
         # Load RNG states from `checkpoint`
