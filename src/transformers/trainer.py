@@ -179,6 +179,7 @@ from .utils import (
 from .utils.import_utils import requires
 from .utils.quantization_config import QuantizationMethod
 
+from perforatedai import globals_perforatedai as GPA
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -380,6 +381,7 @@ class Trainer:
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
+        using_perforatedai: bool = False,
     ):
         # Init flow:
         #   1. Args & seed               – defaults, determinism
@@ -400,7 +402,13 @@ class Trainer:
             logger.info(f"No `TrainingArguments` passed, using `output_dir={output_dir}`.")
             args = TrainingArguments(output_dir=output_dir)
         self.args = args
-        # Seed must be set before instantiating the model when using model_init
+        self.compute_loss_func = compute_loss_func
+        self.using_perforatedai = using_perforatedai
+        
+        # When using PerforatedAI, disable automatic saving to avoid conflicts
+        if self.using_perforatedai:
+            self.args.save_strategy = SaveStrategy.NO
+        # Seed must be set before instantiating the model when using model
         enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
 
         # ---- 2. Accelerator & logging ----------------------------------------------
@@ -565,9 +573,9 @@ class Trainer:
             default_callbacks = default_callbacks + [jit_callback]
             jit_callback.set_trainer(self)
 
-        callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
+        self.callbacks = default_callbacks if callbacks is None else default_callbacks + callbacks
         self.callback_handler = CallbackHandler(
-            callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+            self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
         )
         self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
 
@@ -1466,10 +1474,17 @@ class Trainer:
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader)
 
+        if self.using_perforatedai:
+            original_max_steps = max_steps
+            max_steps = num_update_steps_per_epoch * 100000000  # Effectively infinite
+            print(f"DEBUG: PAI enabled - overriding max_steps from {original_max_steps} to {max_steps} to allow continuous evaluation")
+        self.max_steps = max_steps
+
         epochs_trained, steps_trained_in_current_epoch = self._init_training_state(
             max_steps, num_update_steps_per_epoch, num_train_epochs, resume_from_checkpoint, trial
         )
         model, train_dataloader = self._prepare_for_training(max_steps, train_dataloader, resume_from_checkpoint)
+        self._train_dataloader = train_dataloader  # Store for access after restructuring
 
         # Train!
         logger.info("***** Running training *****")
@@ -1510,9 +1525,11 @@ class Trainer:
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
-        for epoch in range(epochs_trained, num_train_epochs):
+        if self.using_perforatedai:
+            GPA.pai_tracker.set_optimizer_instance(self.optimizer)
+        for epoch in range(epochs_trained, 100000000 if self.using_perforatedai else num_train_epochs):
             self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
-            self._run_epoch(
+            trainingComplete = self._run_epoch(
                 model=model,
                 epoch=epoch,
                 train_dataloader=train_dataloader,
@@ -1525,7 +1542,8 @@ class Trainer:
                 epochs_trained=epochs_trained,
                 steps_trained_in_current_epoch=steps_trained_in_current_epoch,
             )
-            if self.control.should_training_stop:
+            model = self.model
+            if trainingComplete or ((not self.using_perforatedai) and self.control.should_training_stop):
                 break
 
         return self._finalize_training(trial, num_train_samples, start_time)
@@ -1656,6 +1674,7 @@ class Trainer:
         for attr in ("model", "optimizer", "lr_scheduler"):
             setattr(self.callback_handler, attr, getattr(self, attr))
         self.callback_handler.train_dataloader = train_dataloader
+        self._train_dataloader = train_dataloader  # Store for access after restructuring
 
         return model, train_dataloader
 
@@ -1703,6 +1722,7 @@ class Trainer:
         # Outer loop: one iteration per optimizer step. Each iteration prefetches
         # `gradient_accumulation_steps` batches (fewer for the last step if the epoch
         # doesn't divide evenly).
+        trainingComplete = False
         for update_step in range(num_update_steps_trained, num_update_steps_per_epoch):
             num_batches = (
                 self.args.gradient_accumulation_steps if update_step != (num_update_steps_per_epoch - 1) else remainder
@@ -1769,6 +1789,20 @@ class Trainer:
                     self.optimizer.step()
                     self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
 
+                    # Check for NaN gradients
+                    if grad_norm is not None and (torch.isnan(torch.tensor(grad_norm)) if not isinstance(grad_norm, torch.Tensor) else torch.isnan(grad_norm)):
+                        logger.warning(
+                            "\n" + "="*80 + "\n"
+                            f"⚠️  WARNING: NaN GRADIENT DETECTED at step {self.state.global_step}, epoch {epoch + (step + 1) / steps_in_epoch:.2f}\n"
+                            "⚠️  This will cause model corruption and unreliable training!\n"
+                            "⚠️  Common causes:\n"
+                            "⚠️    1. Learning rate too high\n"
+                            "⚠️    2. Numerical instability in the model\n"
+                            "⚠️    3. Issues with input data (extreme values, inf, NaN)\n"
+                            "⚠️  Try: lower learning rate, add gradient clipping (--max_grad_norm 1.0), or check your data.\n"
+                            + "="*80
+                        )
+
                     # get leaning rate before update
                     learning_rate = self._get_learning_rate()
 
@@ -1781,7 +1815,7 @@ class Trainer:
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
-                    self._maybe_log_save_evaluate(
+                    step_complete = self._maybe_log_save_evaluate(
                         self._tr_loss,
                         grad_norm,
                         model,
@@ -1791,12 +1825,14 @@ class Trainer:
                         start_time,
                         learning_rate=learning_rate,
                     )
+                    trainingComplete = trainingComplete or step_complete
+                    model = self.model
                 else:
                     self.control = self.callback_handler.on_substep_end(self.args, self.state, self.control)
 
-                if self.control.should_epoch_stop or self.control.should_training_stop:
+                if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                     break
-            if self.control.should_epoch_stop or self.control.should_training_stop:
+            if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                 break
 
         # PyTorch/XLA relies on the dataloader to insert mark_step each iteration.
@@ -1813,7 +1849,7 @@ class Trainer:
             self.control.should_training_stop = True
 
         self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
-        self._maybe_log_save_evaluate(
+        epoch_complete = self._maybe_log_save_evaluate(
             self._tr_loss,
             grad_norm,
             model,
@@ -1823,6 +1859,9 @@ class Trainer:
             start_time,
             learning_rate=learning_rate,
         )
+        model = self.model
+        trainingComplete = trainingComplete or epoch_complete
+        return trainingComplete
 
     def _finalize_training(self, trial, num_train_samples, start_time):
         """Finalize training: metrics, best-model loading, cleanup. Returns TrainOutput."""
@@ -2062,7 +2101,7 @@ class Trainer:
         ignore_keys_for_eval: list[str] | None,
         start_time: float,
         learning_rate: float | None = None,
-    ) -> None:
+    ) -> bool:
         """Log metrics, run evaluation, and save checkpoints if the current training state requires it."""
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             if is_torch_xla_available():
@@ -2091,8 +2130,83 @@ class Trainer:
             self.log(logs, start_time)
 
         metrics = None
+        trainingComplete = False
         if self.control.should_evaluate:
             metrics = self._evaluate(trial, ignore_keys_for_eval)
+
+            # Check for NaN in evaluation metrics
+            eval_loss = metrics.get('eval_loss')
+            if eval_loss is not None and (torch.isnan(torch.tensor(eval_loss)) if not isinstance(eval_loss, torch.Tensor) else torch.isnan(eval_loss)):
+                logger.warning(
+                    "\n" + "="*80 + "\n"
+                    f"⚠️  WARNING: NaN EVAL_LOSS DETECTED at step {self.state.global_step}, epoch {self.state.epoch:.2f}\n"
+                    "⚠️  The model has become corrupted (likely from earlier NaN gradients)!\n"
+                    "⚠️  Training metrics may appear to improve but the model is BROKEN.\n"
+                    "⚠️  Try: lower learning rate, add gradient clipping (--max_grad_norm 1.0), check for data issues.\n"
+                    + "="*80
+                )
+
+            if self.using_perforatedai:
+                # Get metric values
+                eval_accuracy = metrics.get('eval_accuracy')
+                eval_loss = metrics.get('eval_loss')
+                train_loss_avg = self._total_loss_scalar / self.state.global_step if self.state.global_step > 0 else 0
+                # Map score names to their values and labels
+                score_map = {
+                    'eval_accuracy': (eval_accuracy, 'Eval Accuracy'),
+                    'eval_loss': (eval_loss, 'Eval Loss'),
+                    'train_loss': (train_loss_avg, 'Train Loss')
+                }
+                # Process extra scores (without validation score)
+                for score_name in GPA.pc.get_library_extra_scores() + GPA.pc.get_library_extra_scores_without_graphing():
+                    if score_name not in score_map:
+                        continue
+                    score_value, score_label = score_map[score_name]
+                    if score_value is None:
+                        continue
+                    if score_name in GPA.pc.get_library_extra_scores():
+                        GPA.pai_tracker.add_extra_score(score_value, score_label)
+                    if score_name in GPA.pc.get_library_extra_scores_without_graphing():
+                        GPA.pai_tracker.add_extra_score_without_graphing(score_value, score_label)
+                # Call add_validation_score last, after all extra scores are processed
+                validation_score_name = GPA.pc.get_library_validation_score()
+                if validation_score_name in score_map:
+                    score_value, score_label = score_map[validation_score_name]
+                    if score_value is not None:
+                        self.model, restructured, trainingComplete = GPA.pai_tracker.add_validation_score(score_value, model)
+                    else:
+                        restructured = False
+                        trainingComplete = False
+                else:
+                    restructured = False
+                    trainingComplete = False
+
+                model = self.model
+                if restructured:
+                    self._move_model_to_device(self.model, self.args.device)
+                    self.optimizer = None
+                    self.lr_scheduler = None
+                    self.create_optimizer_and_scheduler(num_training_steps=self.max_steps)
+                    self.callback_handler.optimizer = self.optimizer
+                    self.callback_handler = CallbackHandler(
+                        self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+                    )
+                    if hasattr(self, '_train_dataloader'):
+                        self.callback_handler.train_dataloader = self._train_dataloader
+                    if hasattr(self.lr_scheduler, "step"):
+                        if self.args.optim == OptimizerNames.ADAMW_APEX_FUSED:
+                            model = self.accelerator.prepare(self.model)
+                        else:
+                            model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+                    else:
+                        model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                            self.model, self.optimizer, self.lr_scheduler
+                        )
+                    GPA.pai_tracker.set_optimizer_instance(self.optimizer)
+                self.model.train()
+                self.model_wrapped = self.model
+                self.callback_handler.model = self.model
+
             is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
 
             if self.args.save_strategy == SaveStrategy.BEST:
@@ -2101,6 +2215,8 @@ class Trainer:
         if self.control.should_save:
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
+        return trainingComplete
 
     # ---- Training Utilites ----
     def get_batch_samples(
