@@ -53,11 +53,11 @@ python examples/pytorch/text-generation/winogrande/prepare_winogrande_clm.py \
 
 Train:
 
-accelerate launch examples/pytorch/language-modeling/run_clm_no_trainer.py \
+	python run_clm_no_trainer.py \
 	--model_name_or_path Qwen/Qwen1.5-1.8B \
 	--dataset_name json \
-	--train_file /tmp/winogrande_clm/train.jsonl \
-	--validation_file /tmp/winogrande_clm/validation.jsonl \
+	--train_file winogrande/train.json \
+	--validation_file winogrande/validation.json \
 	--per_device_train_batch_size 4 \
 	--gradient_accumulation_steps 4 \
 	--learning_rate 2e-5 \
