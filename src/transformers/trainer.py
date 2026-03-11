@@ -175,7 +175,11 @@ from .utils import (
 from .utils.import_utils import requires
 from .utils.quantization_config import QuantizationMethod
 
-from perforatedai import globals_perforatedai as GPA
+try:
+    from perforatedai import globals_perforatedai as GPA
+    _PAI_AVAILABLE = True
+except ImportError:
+    _PAI_AVAILABLE = False
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -399,7 +403,7 @@ class Trainer:
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        using_perforatedai: bool = False,
+        using_perforatedai: bool = _PAI_AVAILABLE,
     ):
         if args is None:
             output_dir = "tmp_trainer"
