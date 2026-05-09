@@ -53,7 +53,7 @@ python examples/pytorch/text-generation/winogrande/prepare_winogrande_clm.py \
 
 Train:
 
-accelerate launch examples/pytorch/language-modeling/run_clm_no_trainer.py \
+    python examples/pytorch/language-modeling/run_clm_no_trainer.py \
 	--model_name_or_path Qwen/Qwen1.5-1.8B \
 	--dataset_name json \
 	--train_file /tmp/winogrande_clm/train.jsonl \
