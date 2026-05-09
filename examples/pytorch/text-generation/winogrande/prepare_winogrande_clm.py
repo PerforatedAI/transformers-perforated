@@ -64,7 +64,7 @@ def _write_jsonl(dataset, path, include_answer=True):
 def main():
     parser = argparse.ArgumentParser(description="Prepare Winogrande for CLM fine-tuning")
     parser.add_argument("--dataset_name", type=str, default="winogrande")
-    parser.add_argument("--dataset_config_name", type=str, default="winogrande_xl")
+    parser.add_argument("--dataset_config_name", type=str, default="default")
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument(
         "--include_answer_in_validation",
