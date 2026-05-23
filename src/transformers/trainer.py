@@ -1522,7 +1522,10 @@ class Trainer:
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
 
-        model.zero_grad()
+        if self.using_perforatedai and self.optimizer is not None:
+            self.optimizer.zero_grad()
+        else:
+            model.zero_grad()
 
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
 
@@ -1815,7 +1818,10 @@ class Trainer:
                         if not isinstance(self.lr_scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, GreedyLR)):
                             self.lr_scheduler.step()
 
-                    model.zero_grad()
+                    if self.using_perforatedai and self.optimizer is not None:
+                        self.optimizer.zero_grad()
+                    else:
+                        model.zero_grad()
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
