@@ -385,7 +385,7 @@ class Trainer:
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        using_perforatedai: bool = _PAI_AVAILABLE,
+        using_perforatedai: bool = False,
     ):
         # Init flow:
         #   1. Args & seed               – defaults, determinism
@@ -2162,17 +2162,22 @@ class Trainer:
                 eval_loss = metrics.get('eval_loss')
                 train_loss_avg = self._total_loss_scalar / self.state.global_step if self.state.global_step > 0 else 0
                 # Map score names to their values and labels
-                score_map = {
-                    'eval_accuracy': (eval_accuracy, 'Eval Accuracy'),
-                    'eval_loss': (eval_loss, 'Eval Loss'),
-                    'train_loss': (train_loss_avg, 'Train Loss')
-                }
+                score_map = {key: (val, key) for key, val in metrics.items()}
+                score_map['train_loss'] = (train_loss_avg, 'Train Loss')
+
+                extra_scores = GPA.pc.get_library_extra_scores()
+
+                missed_any = False
                 # Process extra scores (without validation score)
                 for score_name in GPA.pc.get_library_extra_scores() + GPA.pc.get_library_extra_scores_without_graphing():
                     if score_name not in score_map:
+                        print(f"Score name '{score_name}' not found in metrics, skipping...")
+                        missed_any = True
                         continue
                     score_value, score_label = score_map[score_name]
                     if score_value is None:
+                        print(f"Score value for '{score_name}' is None, skipping...")
+                        missed_any = True
                         continue
                     if score_name in GPA.pc.get_library_extra_scores():
                         GPA.pai_tracker.add_extra_score(score_value, score_label)
@@ -2188,6 +2193,10 @@ class Trainer:
                         restructured = False
                         trainingComplete = False
                 else:
+                    print("validation score name not in score map: ", validation_score_name)
+                    missed_any = True
+                if(missed_any):
+                    print("score map: ", score_map)
                     restructured = False
                     trainingComplete = False
 
