@@ -1481,7 +1481,6 @@ class Trainer:
         if self.using_perforatedai:
             original_max_steps = max_steps
             max_steps = num_update_steps_per_epoch * 100000000  # Effectively infinite
-            print(f"DEBUG: PAI enabled - overriding max_steps from {original_max_steps} to {max_steps} to allow continuous evaluation")
         self.max_steps = max_steps
 
         epochs_trained, steps_trained_in_current_epoch = self._init_training_state(
@@ -2197,30 +2196,20 @@ class Trainer:
                     missed_any = True
                 if(missed_any):
                     print("score map: ", score_map)
-                    restructured = False
-                    trainingComplete = False
 
                 model = self.model
                 if restructured:
                     self._move_model_to_device(self.model, self.args.device)
                     self.optimizer = None
                     self.lr_scheduler = None
-                    self.create_optimizer_and_scheduler(num_training_steps=self.max_steps)
-                    self.callback_handler.optimizer = self.optimizer
+                    self.create_optimizer()
+                    self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+                    self.create_scheduler(num_training_steps=self.max_steps)
                     self.callback_handler = CallbackHandler(
                         self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
                     )
                     if hasattr(self, '_train_dataloader'):
                         self.callback_handler.train_dataloader = self._train_dataloader
-                    if hasattr(self.lr_scheduler, "step"):
-                        if self.args.optim == OptimizerNames.ADAMW_APEX_FUSED:
-                            model = self.accelerator.prepare(self.model)
-                        else:
-                            model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
-                    else:
-                        model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
-                            self.model, self.optimizer, self.lr_scheduler
-                        )
                     GPA.pai_tracker.set_optimizer_instance(self.optimizer)
                 self.model.train()
                 self.model_wrapped = self.model
