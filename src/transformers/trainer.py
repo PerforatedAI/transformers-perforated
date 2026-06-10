@@ -2199,8 +2199,6 @@ class Trainer:
                     missed_any = True
                 if(missed_any):
                     print("score map: ", score_map)
-                    restructured = False
-                    trainingComplete = False
 
                 model = self.model
                 if restructured:
@@ -2208,7 +2206,7 @@ class Trainer:
                     self.optimizer = None
                     self.lr_scheduler = None
                     self.create_optimizer()
-                    model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+                    self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
                     self.create_scheduler(num_training_steps=self._scheduler_max_steps)
                     self.callback_handler = CallbackHandler(
                         self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
