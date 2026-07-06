@@ -2228,7 +2228,17 @@ class Trainer:
         metrics = None
         trainingComplete = False
         if self.control.should_evaluate:
+            if self.using_perforatedai and is_torch_xla_available():
+                print(
+                    f"[PAI XLA DEBUG] starting _evaluate global_step={self.state.global_step}",
+                    flush=True,
+                )
             metrics = self._evaluate(trial, ignore_keys_for_eval)
+            if self.using_perforatedai and is_torch_xla_available():
+                print(
+                    f"[PAI XLA DEBUG] finished _evaluate global_step={self.state.global_step}",
+                    flush=True,
+                )
 
             # Check for NaN in evaluation metrics
             eval_loss = metrics.get('eval_loss')
@@ -2274,7 +2284,17 @@ class Trainer:
                 if validation_score_name in score_map:
                     score_value, score_label = score_map[validation_score_name]
                     if score_value is not None:
+                        if self.using_perforatedai and is_torch_xla_available():
+                            print(
+                                f"[PAI XLA DEBUG] calling add_validation_score global_step={self.state.global_step}",
+                                flush=True,
+                            )
                         self.model, restructured, trainingComplete = GPA.pai_tracker.add_validation_score(score_value, model)
+                        if self.using_perforatedai and is_torch_xla_available():
+                            print(
+                                f"[PAI XLA DEBUG] returned add_validation_score global_step={self.state.global_step} restructured={restructured} trainingComplete={trainingComplete}",
+                                flush=True,
+                            )
                     else:
                         restructured = False
                         trainingComplete = False
@@ -2956,7 +2976,22 @@ class Trainer:
         observed_num_examples = 0
 
         # Main evaluation loop
+        xla_pai_eval_debug = self.using_perforatedai and is_torch_xla_available()
+        # Optional safety cap for Trainium eval loops. Set PAI_XLA_MAX_EVAL_BATCHES to limit.
+        max_eval_batches = 0
+        if xla_pai_eval_debug:
+            max_eval_batches = int(os.environ.get("PAI_XLA_MAX_EVAL_BATCHES", "256"))
+            print(
+                f"[PAI XLA DEBUG] evaluation_loop start max_eval_batches={max_eval_batches}",
+                flush=True,
+            )
         for step, inputs in enumerate(dataloader):
+            if xla_pai_eval_debug and max_eval_batches > 0 and step >= max_eval_batches:
+                print(
+                    f"[PAI XLA DEBUG] evaluation_loop early_stop at step={step} due to PAI_XLA_MAX_EVAL_BATCHES",
+                    flush=True,
+                )
+                break
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:
@@ -2964,6 +2999,12 @@ class Trainer:
                 # For batch samplers, batch_size is not known by the dataloader in advance.
                 if batch_size is None:
                     batch_size = observed_batch_size
+
+            if xla_pai_eval_debug and (step < 3 or step % 25 == 0):
+                print(
+                    f"[PAI XLA DEBUG] evaluation_loop step={step} observed_num_examples={observed_num_examples}",
+                    flush=True,
+                )
 
             # Prediction step
             losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
@@ -3047,6 +3088,10 @@ class Trainer:
             else:  # both len(dataloader.dataset) and len(dataloader) fail
                 num_samples = observed_num_examples
         if num_samples == 0 and observed_num_examples > 0:
+            num_samples = observed_num_examples
+
+        if xla_pai_eval_debug and max_eval_batches > 0:
+            # If we capped eval batches, report the number actually observed.
             num_samples = observed_num_examples
 
         # Metrics!
