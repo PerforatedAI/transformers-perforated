@@ -1000,6 +1000,12 @@ class Trainer:
             "multiprocessing_context": "fork" if should_fork else None,
         }
 
+        if self.using_perforatedai and is_torch_xla_available():
+            # Trainium/XLA stability path: avoid pinned-memory/worker interactions.
+            dataloader_params["num_workers"] = 0
+            dataloader_params["pin_memory"] = False
+            dataloader_params["persistent_workers"] = False
+
         if not isinstance(dataset, torch.utils.data.IterableDataset):
             if sampler_fn is not None:
                 dataloader_params["sampler"] = sampler_fn(dataset)
@@ -1010,7 +1016,11 @@ class Trainer:
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
                 )
 
-        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        raw_dataloader = DataLoader(dataset, **dataloader_params)
+        if self.using_perforatedai and is_torch_xla_available():
+            dataloader = raw_dataloader
+        else:
+            dataloader = self.accelerator.prepare(raw_dataloader)
 
         # Store the prepared dataloader for subsequent evaluations if using persistent workers.
         if dataloader_key is not None and self.args.dataloader_persistent_workers:
