@@ -1842,18 +1842,6 @@ class Trainer:
                             f"[PAI XLA DEBUG] after optimizer.step update_step={update_step}",
                             flush=True,
                         )
-                    if is_torch_xla_available():
-                        if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
-                            print(
-                                f"[PAI XLA DEBUG] before xm.mark_step post-optimizer update_step={update_step}",
-                                flush=True,
-                            )
-                        xm.mark_step()
-                        if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
-                            print(
-                                f"[PAI XLA DEBUG] after xm.mark_step post-optimizer update_step={update_step}",
-                                flush=True,
-                            )
                     if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
                         print(
                             f"[PAI XLA DEBUG] before callback on_optimizer_step update_step={update_step}",
