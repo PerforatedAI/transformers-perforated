@@ -1741,7 +1741,11 @@ class Trainer:
         # Outer loop: one iteration per optimizer step. Each iteration prefetches
         # `gradient_accumulation_steps` batches (fewer for the last step if the epoch
         # doesn't divide evenly).
-        debug_xla_loop = self.using_perforatedai and is_torch_xla_available()
+        debug_xla_loop = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+        )
         trainingComplete = False
         for update_step in range(num_update_steps_trained, num_update_steps_per_epoch):
             if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
@@ -2228,13 +2232,21 @@ class Trainer:
         metrics = None
         trainingComplete = False
         if self.control.should_evaluate:
-            if self.using_perforatedai and is_torch_xla_available():
+            if (
+                self.using_perforatedai
+                and is_torch_xla_available()
+                and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+            ):
                 print(
                     f"[PAI XLA DEBUG] starting _evaluate global_step={self.state.global_step}",
                     flush=True,
                 )
             metrics = self._evaluate(trial, ignore_keys_for_eval)
-            if self.using_perforatedai and is_torch_xla_available():
+            if (
+                self.using_perforatedai
+                and is_torch_xla_available()
+                and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+            ):
                 print(
                     f"[PAI XLA DEBUG] finished _evaluate global_step={self.state.global_step}",
                     flush=True,
@@ -2284,13 +2296,21 @@ class Trainer:
                 if validation_score_name in score_map:
                     score_value, score_label = score_map[validation_score_name]
                     if score_value is not None:
-                        if self.using_perforatedai and is_torch_xla_available():
+                        if (
+                            self.using_perforatedai
+                            and is_torch_xla_available()
+                            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+                        ):
                             print(
                                 f"[PAI XLA DEBUG] calling add_validation_score global_step={self.state.global_step}",
                                 flush=True,
                             )
                         self.model, restructured, trainingComplete = GPA.pai_tracker.add_validation_score(score_value, model)
-                        if self.using_perforatedai and is_torch_xla_available():
+                        if (
+                            self.using_perforatedai
+                            and is_torch_xla_available()
+                            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+                        ):
                             print(
                                 f"[PAI XLA DEBUG] returned add_validation_score global_step={self.state.global_step} restructured={restructured} trainingComplete={trainingComplete}",
                                 flush=True,
@@ -2341,7 +2361,12 @@ class Trainer:
         Collects a specified number of batches from the epoch iterator and optionally counts the number of items in the batches to properly scale the loss.
         """
         batch_samples = []
-        debug_xla_loader = self.using_perforatedai and is_torch_xla_available() and self.state.global_step < 5
+        debug_xla_loader = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+            and self.state.global_step < 5
+        )
 
         for batch_idx in range(num_batches):
             try:
@@ -2976,11 +3001,14 @@ class Trainer:
         observed_num_examples = 0
 
         # Main evaluation loop
-        xla_pai_eval_debug = self.using_perforatedai and is_torch_xla_available()
-        # Optional safety cap for Trainium eval loops. Set PAI_XLA_MAX_EVAL_BATCHES to limit.
-        max_eval_batches = 0
+        xla_pai_eval_debug = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+        )
+        # Optional safety cap for Trainium eval loops. Disabled by default.
+        max_eval_batches = int(os.environ.get("PAI_XLA_MAX_EVAL_BATCHES", "0"))
         if xla_pai_eval_debug:
-            max_eval_batches = int(os.environ.get("PAI_XLA_MAX_EVAL_BATCHES", "256"))
             print(
                 f"[PAI XLA DEBUG] evaluation_loop start max_eval_batches={max_eval_batches}",
                 flush=True,
@@ -3090,7 +3118,7 @@ class Trainer:
         if num_samples == 0 and observed_num_examples > 0:
             num_samples = observed_num_examples
 
-        if xla_pai_eval_debug and max_eval_batches > 0:
+        if max_eval_batches > 0:
             # If we capped eval batches, report the number actually observed.
             num_samples = observed_num_examples
 
