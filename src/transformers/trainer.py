@@ -1739,8 +1739,6 @@ class Trainer:
                     f"[PAI XLA DEBUG] enter update_step={update_step} global_step={self.state.global_step}",
                     flush=True,
                 )
-            if is_torch_xla_available():
-                xm.mark_step()
             num_batches = (
                 self.args.gradient_accumulation_steps if update_step != (num_update_steps_per_epoch - 1) else remainder
             )
