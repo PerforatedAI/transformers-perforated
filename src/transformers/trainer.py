@@ -3006,6 +3006,13 @@ class Trainer:
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
+        xla_pai_eval_trace = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_EVAL_TRACE", "1") == "1"
+        )
+        eval_trace_every = int(os.environ.get("PAI_XLA_EVAL_HEARTBEAT_STEPS", "10"))
+        eval_slow_step_sec = float(os.environ.get("PAI_XLA_EVAL_SLOW_STEP_SEC", "20"))
         # Optional safety cap for Trainium eval loops.
         # If env var is unset, use a conservative default on XLA+PAI to avoid
         # long validation compile stalls; users can override explicitly.
@@ -3024,13 +3031,23 @@ class Trainer:
                 f"[PAI] Capping eval to {max_eval_batches} batches (override with PAI_XLA_MAX_EVAL_BATCHES)",
                 flush=True,
             )
+        if xla_pai_eval_trace:
+            print(
+                "[PAI XLA EVAL TRACE] enabled "
+                f"heartbeat_every={eval_trace_every} slow_step_sec={eval_slow_step_sec} "
+                f"cache={os.environ.get('NEURON_COMPILE_CACHE_URL', '(default)')}",
+                flush=True,
+            )
         for step, inputs in enumerate(dataloader):
-            if xla_pai_eval_debug and max_eval_batches > 0 and step >= max_eval_batches:
-                print(
-                    f"[PAI XLA DEBUG] evaluation_loop early_stop at step={step} due to PAI_XLA_MAX_EVAL_BATCHES",
-                    flush=True,
-                )
+            if max_eval_batches > 0 and step >= max_eval_batches:
+                if xla_pai_eval_debug or xla_pai_eval_trace:
+                    print(
+                        f"[PAI XLA DEBUG] evaluation_loop early_stop at step={step} due to PAI_XLA_MAX_EVAL_BATCHES",
+                        flush=True,
+                    )
                 break
+
+            step_start = time.monotonic()
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
             if observed_batch_size is not None:
@@ -3046,16 +3063,22 @@ class Trainer:
                 )
 
             # Prediction step
+            pred_start = time.monotonic()
             losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+            pred_time = time.monotonic() - pred_start
             main_input_name = getattr(self.model, "main_input_name", "input_ids")
             inputs_decode = (
                 self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
             )
 
+            mark_step_time = 0.0
             if is_torch_xla_available():
+                mark_step_start = time.monotonic()
                 xm.mark_step()
+                mark_step_time = time.monotonic() - mark_step_start
 
             # Update containers
+            gather_start = time.monotonic()
             if losses is not None:
                 losses = self.gather_function(losses.repeat(batch_size))
                 all_losses.add(losses)
@@ -3078,8 +3101,25 @@ class Trainer:
                 labels = self.gather_function(labels)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_labels.add(labels)
+            gather_time = time.monotonic() - gather_start
 
+            callback_start = time.monotonic()
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+            callback_time = time.monotonic() - callback_start
+
+            step_time = time.monotonic() - step_start
+            if xla_pai_eval_trace and (
+                step < 3
+                or step % max(1, eval_trace_every) == 0
+                or step_time >= eval_slow_step_sec
+            ):
+                print(
+                    "[PAI XLA EVAL TRACE] "
+                    f"step={step} total={step_time:.2f}s pred={pred_time:.2f}s "
+                    f"mark={mark_step_time:.2f}s gather={gather_time:.2f}s "
+                    f"callback={callback_time:.2f}s observed={observed_num_examples}",
+                    flush=True,
+                )
 
             if self.args.batch_eval_metrics:
                 if self.compute_metrics is not None and logits is not None and labels is not None:
