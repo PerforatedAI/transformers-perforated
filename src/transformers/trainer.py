@@ -2323,14 +2323,44 @@ class Trainer:
         Collects a specified number of batches from the epoch iterator and optionally counts the number of items in the batches to properly scale the loss.
         """
         batch_samples = []
+        debug_xla_loader = self.using_perforatedai and is_torch_xla_available() and self.state.global_step < 5
 
-        for _ in range(num_batches):
+        for batch_idx in range(num_batches):
             try:
+                if debug_xla_loader:
+                    print(
+                        f"[PAI XLA DEBUG] get_batch_samples before next() global_step={self.state.global_step} batch_idx={batch_idx}",
+                        flush=True,
+                    )
                 batch_samples.append(next(epoch_iterator))
+                if debug_xla_loader:
+                    print(
+                        f"[PAI XLA DEBUG] get_batch_samples after next() global_step={self.state.global_step} batch_idx={batch_idx}",
+                        flush=True,
+                    )
             except StopIteration:
+                if debug_xla_loader:
+                    print(
+                        f"[PAI XLA DEBUG] get_batch_samples stop_iteration global_step={self.state.global_step} batch_idx={batch_idx}",
+                        flush=True,
+                    )
                 break
 
-        num_items_in_batch = self._get_num_items_in_batch(batch_samples, device)
+        if debug_xla_loader:
+            print(
+                f"[PAI XLA DEBUG] get_batch_samples before _get_num_items_in_batch global_step={self.state.global_step} collected={len(batch_samples)}",
+                flush=True,
+            )
+        if self.using_perforatedai and is_torch_xla_available():
+            # Avoid token-count gather/sync on XLA; not needed for this PAI path.
+            num_items_in_batch = None
+        else:
+            num_items_in_batch = self._get_num_items_in_batch(batch_samples, device)
+        if debug_xla_loader:
+            print(
+                f"[PAI XLA DEBUG] get_batch_samples after _get_num_items_in_batch global_step={self.state.global_step} num_items_type={type(num_items_in_batch).__name__ if num_items_in_batch is not None else 'None'}",
+                flush=True,
+            )
         return batch_samples, num_items_in_batch
 
     def _get_num_items_in_batch(self, batch_samples: list, device: torch.device) -> torch.Tensor | int | None:
