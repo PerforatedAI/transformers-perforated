@@ -3006,11 +3006,22 @@ class Trainer:
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
-        # Optional safety cap for Trainium eval loops. Disabled by default.
-        max_eval_batches = int(os.environ.get("PAI_XLA_MAX_EVAL_BATCHES", "0"))
+        # Optional safety cap for Trainium eval loops.
+        # If env var is unset, use a conservative default on XLA+PAI to avoid
+        # long validation compile stalls; users can override explicitly.
+        max_eval_batches_env = os.environ.get("PAI_XLA_MAX_EVAL_BATCHES")
+        if max_eval_batches_env is None and self.using_perforatedai and is_torch_xla_available():
+            max_eval_batches = 64
+        else:
+            max_eval_batches = int(max_eval_batches_env or "0")
         if xla_pai_eval_debug:
             print(
                 f"[PAI XLA DEBUG] evaluation_loop start max_eval_batches={max_eval_batches}",
+                flush=True,
+            )
+        elif max_eval_batches > 0 and self.using_perforatedai and is_torch_xla_available():
+            print(
+                f"[PAI] Capping eval to {max_eval_batches} batches (override with PAI_XLA_MAX_EVAL_BATCHES)",
                 flush=True,
             )
         for step, inputs in enumerate(dataloader):
