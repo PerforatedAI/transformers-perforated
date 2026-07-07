@@ -386,6 +386,7 @@ class Trainer:
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         using_perforatedai: bool = False,
+        using_trainium: bool = False,
     ):
         # Init flow:
         #   1. Args & seed               – defaults, determinism
@@ -408,6 +409,7 @@ class Trainer:
         self.args = args
         self.compute_loss_func = compute_loss_func
         self.using_perforatedai = using_perforatedai
+        self.using_trainium = using_trainium
         
         # When using PerforatedAI, disable automatic saving to avoid conflicts
         if self.using_perforatedai:
@@ -2239,7 +2241,7 @@ class Trainer:
                 # On Trainium+PAI this log-boundary mark_step can trigger long compile stalls.
                 # Keep it opt-in for debugging/compatibility.
                 allow_log_mark_step = (
-                    (not self.using_perforatedai)
+                    (not self.using_perforatedai and not self.using_trainium)
                     or os.environ.get("PAI_XLA_LOG_MARK_STEP", "0") == "1"
                 )
                 if allow_log_mark_step:
@@ -2269,7 +2271,7 @@ class Trainer:
 
             # all_gather + mean() to get average loss over all processes
             use_local_log_loss = (
-                self.using_perforatedai
+                (self.using_perforatedai or self.using_trainium)
                 and is_torch_xla_available()
                 and (
                     self.args.world_size <= 1
@@ -2277,9 +2279,9 @@ class Trainer:
                 )
             )
             skip_loss_scalar_sync = (
-                self.using_perforatedai
+                (self.using_perforatedai or self.using_trainium)
                 and is_torch_xla_available()
-                and os.environ.get("PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC", "0") == "1"
+                and os.environ.get("PAI_XLA_ALLOW_LOG_LOSS_SCALAR_SYNC", "0") != "1"
             )
             if debug_mlse_this_step:
                 print(
@@ -2287,7 +2289,7 @@ class Trainer:
                     f"use_local_log_loss={use_local_log_loss} "
                     f"world_size={self.args.world_size} "
                     f"PAI_XLA_SKIP_LOG_LOSS_GATHER={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_GATHER', '0')} "
-                    f"PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC', '0')}",
+                    f"PAI_XLA_ALLOW_LOG_LOSS_SCALAR_SYNC={os.environ.get('PAI_XLA_ALLOW_LOG_LOSS_SCALAR_SYNC', '0')}",
                     flush=True,
                 )
             if debug_mlse_this_step:
