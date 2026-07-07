@@ -2336,6 +2336,7 @@ class Trainer:
                 flush=True,
             )
 
+        if metrics is not None:
             # Check for NaN in evaluation metrics
             eval_loss = metrics.get('eval_loss')
             if eval_loss is not None and (torch.isnan(torch.tensor(eval_loss)) if not isinstance(eval_loss, torch.Tensor) else torch.isnan(eval_loss)):
