@@ -2277,6 +2277,14 @@ class Trainer:
                 )
             )
             if debug_mlse_this_step:
+                print(
+                    "[PAI XLA DEBUG] log loss path "
+                    f"use_local_log_loss={use_local_log_loss} "
+                    f"world_size={self.args.world_size} "
+                    f"PAI_XLA_SKIP_LOG_LOSS_GATHER={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_GATHER', '0')}",
+                    flush=True,
+                )
+            if debug_mlse_this_step:
                 _gather_start = time.monotonic()
                 print(
                     "[PAI XLA DEBUG] before "
