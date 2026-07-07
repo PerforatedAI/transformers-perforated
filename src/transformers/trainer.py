@@ -2205,7 +2205,34 @@ class Trainer:
         """Log metrics, run evaluation, and save checkpoints if the current training state requires it."""
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             if is_torch_xla_available():
-                xm.mark_step()
+                # On Trainium+PAI this log-boundary mark_step can trigger long compile stalls.
+                # Keep it opt-in for debugging/compatibility.
+                allow_log_mark_step = (
+                    (not self.using_perforatedai)
+                    or os.environ.get("PAI_XLA_LOG_MARK_STEP", "0") == "1"
+                )
+                if allow_log_mark_step:
+                    if os.environ.get("PAI_XLA_DEBUG", "0") == "1":
+                        _ms_start = time.monotonic()
+                        print(
+                            f"[PAI XLA DEBUG] before log xm.mark_step global_step={self.state.global_step}",
+                            flush=True,
+                        )
+                    xm.mark_step()
+                    if os.environ.get("PAI_XLA_DEBUG", "0") == "1":
+                        _ms_elapsed = time.monotonic() - _ms_start
+                        print(
+                            f"[PAI XLA DEBUG] after log xm.mark_step global_step={self.state.global_step} elapsed={_ms_elapsed:.2f}s",
+                            flush=True,
+                        )
+                elif os.environ.get("PAI_XLA_DEBUG", "0") == "1":
+                    if not getattr(self, "_pai_xla_logged_skip_log_mark_step", False):
+                        print(
+                            "[PAI XLA DEBUG] skipping log xm.mark_step for PAI+XLA "
+                            "(set PAI_XLA_LOG_MARK_STEP=1 to force)",
+                            flush=True,
+                        )
+                        self._pai_xla_logged_skip_log_mark_step = True
 
             logs: dict[str, float] = {}
 
@@ -2241,14 +2268,16 @@ class Trainer:
                     f"[PAI XLA DEBUG] starting _evaluate global_step={self.state.global_step}",
                     flush=True,
                 )
+                _eval_start = time.monotonic()
             metrics = self._evaluate(trial, ignore_keys_for_eval)
             if (
                 self.using_perforatedai
                 and is_torch_xla_available()
                 and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
             ):
+                _eval_elapsed = time.monotonic() - _eval_start
                 print(
-                    f"[PAI XLA DEBUG] finished _evaluate global_step={self.state.global_step}",
+                    f"[PAI XLA DEBUG] finished _evaluate global_step={self.state.global_step} elapsed={_eval_elapsed:.2f}s",
                     flush=True,
                 )
 
