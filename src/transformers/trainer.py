@@ -2276,23 +2276,31 @@ class Trainer:
                     or os.environ.get("PAI_XLA_SKIP_LOG_LOSS_GATHER", "0") == "1"
                 )
             )
+            skip_loss_scalar_sync = (
+                self.using_perforatedai
+                and is_torch_xla_available()
+                and os.environ.get("PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC", "0") == "1"
+            )
             if debug_mlse_this_step:
                 print(
                     "[PAI XLA DEBUG] log loss path "
                     f"use_local_log_loss={use_local_log_loss} "
                     f"world_size={self.args.world_size} "
-                    f"PAI_XLA_SKIP_LOG_LOSS_GATHER={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_GATHER', '0')}",
+                    f"PAI_XLA_SKIP_LOG_LOSS_GATHER={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_GATHER', '0')} "
+                    f"PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC={os.environ.get('PAI_XLA_SKIP_LOG_LOSS_SCALAR_SYNC', '0')}",
                     flush=True,
                 )
             if debug_mlse_this_step:
                 _gather_start = time.monotonic()
                 print(
                     "[PAI XLA DEBUG] before "
-                    f"{'local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss'} "
+                    f"{'skip tr_loss scalar sync' if skip_loss_scalar_sync else ('local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss')} "
                     f"global_step={self.state.global_step}",
                     flush=True,
                 )
-            if use_local_log_loss:
+            if skip_loss_scalar_sync:
+                tr_loss_scalar = None
+            elif use_local_log_loss:
                 tr_loss_scalar = tr_loss.detach().item()
             else:
                 tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
@@ -2300,7 +2308,7 @@ class Trainer:
                 _gather_elapsed = time.monotonic() - _gather_start
                 print(
                     "[PAI XLA DEBUG] after "
-                    f"{'local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss'} "
+                    f"{'skip tr_loss scalar sync' if skip_loss_scalar_sync else ('local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss')} "
                     f"global_step={self.state.global_step} elapsed={_gather_elapsed:.2f}s",
                     flush=True,
                 )
@@ -2308,7 +2316,8 @@ class Trainer:
             # reset tr_loss to zero
             tr_loss -= tr_loss
 
-            logs["loss"] = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
+            if tr_loss_scalar is not None:
+                logs["loss"] = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
             if grad_norm is not None:
                 logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             if learning_rate is not None:
@@ -2316,7 +2325,8 @@ class Trainer:
             else:
                 logs["learning_rate"] = self._get_learning_rate()
 
-            self._total_loss_scalar += tr_loss_scalar
+            if tr_loss_scalar is not None:
+                self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
 
