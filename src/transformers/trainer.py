@@ -2217,6 +2217,9 @@ class Trainer:
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
         debug_mlse_heartbeat = int(os.environ.get("PAI_XLA_MLSE_HEARTBEAT_STEPS", "10"))
+        metrics_heartbeat = int(os.environ.get("PAI_XLA_METRICS_HEARTBEAT_STEPS", "0"))
+        metrics_full_report = os.environ.get("PAI_XLA_METRICS_FULL", "0") == "1"
+        metrics_clear_after_dump = os.environ.get("PAI_XLA_METRICS_CLEAR", "0") == "1"
         debug_mlse_this_step = debug_mlse and (
             self.state.global_step < 5
             or (
@@ -2451,6 +2454,25 @@ class Trainer:
                 f"[PAI XLA DEBUG] exit _maybe_log_save_evaluate global_step={self.state.global_step} trainingComplete={trainingComplete}",
                 flush=True,
             )
+
+        if (
+            debug_mlse
+            and metrics_heartbeat > 0
+            and self.state.global_step > 0
+            and (self.state.global_step % max(1, metrics_heartbeat) == 0)
+        ):
+            try:
+                metrics_text = met.metrics_report() if metrics_full_report else met.short_metrics_report()
+                xm.master_print(
+                    f"[PAI XLA METRICS] scope=maybe_log_save_evaluate global_step={self.state.global_step}\n{metrics_text}"
+                )
+                if metrics_clear_after_dump:
+                    met.clear_all()
+            except Exception as e:
+                print(
+                    f"[PAI XLA DEBUG] failed to dump XLA metrics in _maybe_log_save_evaluate: {e}",
+                    flush=True,
+                )
 
         return trainingComplete
 
@@ -3121,6 +3143,10 @@ class Trainer:
         )
         eval_trace_every = int(os.environ.get("PAI_XLA_EVAL_HEARTBEAT_STEPS", "10"))
         eval_slow_step_sec = float(os.environ.get("PAI_XLA_EVAL_SLOW_STEP_SEC", "20"))
+        eval_metrics_heartbeat = int(os.environ.get("PAI_XLA_EVAL_METRICS_HEARTBEAT_STEPS", "0"))
+        eval_metrics_on_slow = os.environ.get("PAI_XLA_EVAL_METRICS_ON_SLOW_STEP", "1") == "1"
+        eval_metrics_full_report = os.environ.get("PAI_XLA_EVAL_METRICS_FULL", "0") == "1"
+        eval_metrics_clear_after_dump = os.environ.get("PAI_XLA_EVAL_METRICS_CLEAR", "0") == "1"
         # Optional safety cap for Trainium eval loops.
         # If env var is unset, use a conservative default on XLA+PAI to avoid
         # long validation compile stalls; users can override explicitly.
@@ -3228,6 +3254,30 @@ class Trainer:
                     f"callback={callback_time:.2f}s observed={observed_num_examples}",
                     flush=True,
                 )
+
+            dump_eval_metrics = (
+                xla_pai_eval_debug
+                and eval_metrics_heartbeat > 0
+                and (step % max(1, eval_metrics_heartbeat) == 0)
+            ) or (
+                xla_pai_eval_debug
+                and eval_metrics_on_slow
+                and step_time >= eval_slow_step_sec
+            )
+            if dump_eval_metrics:
+                try:
+                    eval_metrics_text = met.metrics_report() if eval_metrics_full_report else met.short_metrics_report()
+                    xm.master_print(
+                        "[PAI XLA METRICS] "
+                        f"scope=evaluation_loop step={step} step_time={step_time:.2f}s\n{eval_metrics_text}"
+                    )
+                    if eval_metrics_clear_after_dump:
+                        met.clear_all()
+                except Exception as e:
+                    print(
+                        f"[PAI XLA DEBUG] failed to dump XLA eval metrics at step={step}: {e}",
+                        flush=True,
+                    )
 
             if self.args.batch_eval_metrics:
                 if self.compute_metrics is not None and logits is not None and labels is not None:
