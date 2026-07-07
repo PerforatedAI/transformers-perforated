@@ -1746,9 +1746,17 @@ class Trainer:
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
+        xla_debug_heartbeat_steps = int(os.environ.get("PAI_XLA_TRAIN_HEARTBEAT_STEPS", "50"))
         trainingComplete = False
         for update_step in range(num_update_steps_trained, num_update_steps_per_epoch):
-            if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+            xla_debug_this_step = debug_xla_loop and (
+                self.state.global_step < 5
+                or (
+                    xla_debug_heartbeat_steps > 0
+                    and (self.state.global_step % max(1, xla_debug_heartbeat_steps) == 0)
+                )
+            )
+            if xla_debug_this_step:
                 print(
                     f"[PAI XLA DEBUG] enter update_step={update_step} global_step={self.state.global_step}",
                     flush=True,
@@ -1756,13 +1764,13 @@ class Trainer:
             num_batches = (
                 self.args.gradient_accumulation_steps if update_step != (num_update_steps_per_epoch - 1) else remainder
             )
-            if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+            if xla_debug_this_step:
                 print(
                     f"[PAI XLA DEBUG] fetching batches num_batches={num_batches}",
                     flush=True,
                 )
             batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches, self.args.device)
-            if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+            if xla_debug_this_step:
                 print(
                     f"[PAI XLA DEBUG] fetched batches count={len(batch_samples)}",
                     flush=True,
@@ -1798,14 +1806,14 @@ class Trainer:
                     sync_context = contextlib.nullcontext
                 else:
                     sync_context = functools.partial(self.accelerator.no_sync, model=model)
-                if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                if xla_debug_this_step:
                     print(
                         f"[PAI XLA DEBUG] before training_step update_step={update_step} micro_batch={i}",
                         flush=True,
                     )
                 with sync_context():
                     tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
-                if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                if xla_debug_this_step:
                     print(
                         f"[PAI XLA DEBUG] after training_step update_step={update_step} micro_batch={i}",
                         flush=True,
@@ -1835,24 +1843,24 @@ class Trainer:
                     grad_norm = self._get_grad_norm(model, grad_norm=grad_norm)
 
                     self.control = self.callback_handler.on_pre_optimizer_step(self.args, self.state, self.control)
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] before optimizer.step update_step={update_step}",
                             flush=True,
                         )
                     self.optimizer.step()
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] after optimizer.step update_step={update_step}",
                             flush=True,
                         )
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] before callback on_optimizer_step update_step={update_step}",
                             flush=True,
                         )
                     self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] after callback on_optimizer_step update_step={update_step}",
                             flush=True,
@@ -1886,13 +1894,13 @@ class Trainer:
                     if not self.accelerator.optimizer_step_was_skipped:
                         # Delay optimizer scheduling until metrics are generated
                         if not isinstance(self.lr_scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, GreedyLR)):
-                            if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                            if xla_debug_this_step:
                                 print(
                                     f"[PAI XLA DEBUG] before lr_scheduler.step update_step={update_step}",
                                     flush=True,
                                 )
                             self.lr_scheduler.step()
-                            if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                            if xla_debug_this_step:
                                 print(
                                     f"[PAI XLA DEBUG] after lr_scheduler.step update_step={update_step}",
                                     flush=True,
@@ -1905,7 +1913,7 @@ class Trainer:
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] before maybe_log_save_evaluate update_step={update_step} global_step={self.state.global_step}",
                             flush=True,
@@ -1920,7 +1928,7 @@ class Trainer:
                         start_time,
                         learning_rate=learning_rate,
                     )
-                    if debug_xla_loop and self.state.global_step < 3 and update_step < 5:
+                    if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] after maybe_log_save_evaluate update_step={update_step} step_complete={step_complete}",
                             flush=True,
@@ -2394,31 +2402,38 @@ class Trainer:
             self.using_perforatedai
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
-            and self.state.global_step < 5
+        )
+        xla_loader_heartbeat_steps = int(os.environ.get("PAI_XLA_TRAIN_HEARTBEAT_STEPS", "50"))
+        debug_xla_loader_this_step = debug_xla_loader and (
+            self.state.global_step < 5
+            or (
+                xla_loader_heartbeat_steps > 0
+                and (self.state.global_step % max(1, xla_loader_heartbeat_steps) == 0)
+            )
         )
 
         for batch_idx in range(num_batches):
             try:
-                if debug_xla_loader:
+                if debug_xla_loader_this_step:
                     print(
                         f"[PAI XLA DEBUG] get_batch_samples before next() global_step={self.state.global_step} batch_idx={batch_idx}",
                         flush=True,
                     )
                 batch_samples.append(next(epoch_iterator))
-                if debug_xla_loader:
+                if debug_xla_loader_this_step:
                     print(
                         f"[PAI XLA DEBUG] get_batch_samples after next() global_step={self.state.global_step} batch_idx={batch_idx}",
                         flush=True,
                     )
             except StopIteration:
-                if debug_xla_loader:
+                if debug_xla_loader_this_step:
                     print(
                         f"[PAI XLA DEBUG] get_batch_samples stop_iteration global_step={self.state.global_step} batch_idx={batch_idx}",
                         flush=True,
                     )
                 break
 
-        if debug_xla_loader:
+        if debug_xla_loader_this_step:
             print(
                 f"[PAI XLA DEBUG] get_batch_samples before _get_num_items_in_batch global_step={self.state.global_step} collected={len(batch_samples)}",
                 flush=True,
@@ -2428,7 +2443,7 @@ class Trainer:
             num_items_in_batch = None
         else:
             num_items_in_batch = self._get_num_items_in_batch(batch_samples, device)
-        if debug_xla_loader:
+        if debug_xla_loader_this_step:
             print(
                 f"[PAI XLA DEBUG] get_batch_samples after _get_num_items_in_batch global_step={self.state.global_step} num_items_type={type(num_items_in_batch).__name__ if num_items_in_batch is not None else 'None'}",
                 flush=True,
