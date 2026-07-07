@@ -4455,6 +4455,10 @@ class Trainer:
 
     def store_flos(self) -> None:
         """Store the number of floating-point operations that went into the model."""
+        if self.using_trainium and is_torch_xla_available():
+            self.current_flos = 0
+            return
+
         if self.args.parallel_mode == ParallelMode.DISTRIBUTED:
             self.state.total_flos += (
                 distributed_broadcast_scalars([self.current_flos], device=self.args.device).sum().item()
