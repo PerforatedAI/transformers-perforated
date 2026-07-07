@@ -2268,17 +2268,32 @@ class Trainer:
             logs: dict[str, float] = {}
 
             # all_gather + mean() to get average loss over all processes
+            use_local_log_loss = (
+                self.using_perforatedai
+                and is_torch_xla_available()
+                and (
+                    self.args.world_size <= 1
+                    or os.environ.get("PAI_XLA_SKIP_LOG_LOSS_GATHER", "0") == "1"
+                )
+            )
             if debug_mlse_this_step:
                 _gather_start = time.monotonic()
                 print(
-                    f"[PAI XLA DEBUG] before nested_gather tr_loss global_step={self.state.global_step}",
+                    "[PAI XLA DEBUG] before "
+                    f"{'local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss'} "
+                    f"global_step={self.state.global_step}",
                     flush=True,
                 )
-            tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+            if use_local_log_loss:
+                tr_loss_scalar = tr_loss.detach().item()
+            else:
+                tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
             if debug_mlse_this_step:
                 _gather_elapsed = time.monotonic() - _gather_start
                 print(
-                    f"[PAI XLA DEBUG] after nested_gather tr_loss global_step={self.state.global_step} elapsed={_gather_elapsed:.2f}s",
+                    "[PAI XLA DEBUG] after "
+                    f"{'local tr_loss scalar' if use_local_log_loss else 'nested_gather tr_loss'} "
+                    f"global_step={self.state.global_step} elapsed={_gather_elapsed:.2f}s",
                     flush=True,
                 )
 
