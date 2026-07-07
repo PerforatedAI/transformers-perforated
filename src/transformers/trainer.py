@@ -2211,6 +2211,26 @@ class Trainer:
         learning_rate: float | None = None,
     ) -> bool:
         """Log metrics, run evaluation, and save checkpoints if the current training state requires it."""
+        debug_mlse = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+        )
+        debug_mlse_heartbeat = int(os.environ.get("PAI_XLA_MLSE_HEARTBEAT_STEPS", "10"))
+        debug_mlse_this_step = debug_mlse and (
+            self.state.global_step < 5
+            or (
+                debug_mlse_heartbeat > 0
+                and (self.state.global_step % max(1, debug_mlse_heartbeat) == 0)
+            )
+        )
+        if debug_mlse_this_step:
+            print(
+                "[PAI XLA DEBUG] enter _maybe_log_save_evaluate "
+                f"global_step={self.state.global_step} should_log={self.control.should_log} "
+                f"should_evaluate={self.control.should_evaluate} should_save={self.control.should_save}",
+                flush=True,
+            )
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
             if is_torch_xla_available():
                 # On Trainium+PAI this log-boundary mark_step can trigger long compile stalls.
@@ -2245,7 +2265,19 @@ class Trainer:
             logs: dict[str, float] = {}
 
             # all_gather + mean() to get average loss over all processes
+            if debug_mlse_this_step:
+                _gather_start = time.monotonic()
+                print(
+                    f"[PAI XLA DEBUG] before nested_gather tr_loss global_step={self.state.global_step}",
+                    flush=True,
+                )
             tr_loss_scalar = nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+            if debug_mlse_this_step:
+                _gather_elapsed = time.monotonic() - _gather_start
+                print(
+                    f"[PAI XLA DEBUG] after nested_gather tr_loss global_step={self.state.global_step} elapsed={_gather_elapsed:.2f}s",
+                    flush=True,
+                )
 
             # reset tr_loss to zero
             tr_loss -= tr_loss
@@ -2262,7 +2294,17 @@ class Trainer:
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
 
+            if debug_mlse_this_step:
+                print(
+                    f"[PAI XLA DEBUG] before self.log global_step={self.state.global_step}",
+                    flush=True,
+                )
             self.log(logs, start_time)
+            if debug_mlse_this_step:
+                print(
+                    f"[PAI XLA DEBUG] after self.log global_step={self.state.global_step}",
+                    flush=True,
+                )
 
         metrics = None
         trainingComplete = False
@@ -2288,6 +2330,11 @@ class Trainer:
                     f"[PAI XLA DEBUG] finished _evaluate global_step={self.state.global_step} elapsed={_eval_elapsed:.2f}s",
                     flush=True,
                 )
+        elif debug_mlse_this_step:
+            print(
+                f"[PAI XLA DEBUG] skipping _evaluate global_step={self.state.global_step} should_evaluate=False",
+                flush=True,
+            )
 
             # Check for NaN in evaluation metrics
             eval_loss = metrics.get('eval_loss')
@@ -2385,8 +2432,24 @@ class Trainer:
                 self.control.should_save = is_new_best_metric
 
         if self.control.should_save:
+            if debug_mlse_this_step:
+                print(
+                    f"[PAI XLA DEBUG] before _save_checkpoint global_step={self.state.global_step}",
+                    flush=True,
+                )
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            if debug_mlse_this_step:
+                print(
+                    f"[PAI XLA DEBUG] after _save_checkpoint global_step={self.state.global_step}",
+                    flush=True,
+                )
+
+        if debug_mlse_this_step:
+            print(
+                f"[PAI XLA DEBUG] exit _maybe_log_save_evaluate global_step={self.state.global_step} trainingComplete={trainingComplete}",
+                flush=True,
+            )
 
         return trainingComplete
 
