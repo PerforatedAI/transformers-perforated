@@ -1540,6 +1540,7 @@ class Trainer:
             steps_in_epoch,
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader)
+        self._num_update_steps_per_epoch = num_update_steps_per_epoch
 
         if self.using_perforatedai:
             original_max_steps = max_steps
@@ -2349,10 +2350,23 @@ class Trainer:
             and os.environ.get("PAI_XLA_EVAL_DIAG", "1") == "1"
         )
         eval_diag_steps = int(os.environ.get("PAI_XLA_EVAL_DIAG_STEPS", "25"))
+        force_eval_every_steps = int(os.environ.get("PAI_XLA_FORCE_EVAL_EVERY_STEPS", "0"))
         debug_mlse_heartbeat = int(os.environ.get("PAI_XLA_MLSE_HEARTBEAT_STEPS", "10"))
         metrics_heartbeat = int(os.environ.get("PAI_XLA_METRICS_HEARTBEAT_STEPS", "0"))
         metrics_full_report = os.environ.get("PAI_XLA_METRICS_FULL", "0") == "1"
         metrics_clear_after_dump = os.environ.get("PAI_XLA_METRICS_CLEAR", "0") == "1"
+        eval_strategy_value = str(self.args.eval_strategy)
+        if eval_strategy_value.endswith("EPOCH"):
+            steps_per_epoch = max(1, getattr(self, "_num_update_steps_per_epoch", 0) or 0)
+            next_eval_global_step = (
+                ((self.state.global_step // steps_per_epoch) + 1) * steps_per_epoch if steps_per_epoch > 0 else None
+            )
+        elif eval_strategy_value.endswith("STEPS") and self.state.eval_steps > 0:
+            eval_steps = max(1, self.state.eval_steps)
+            next_eval_global_step = ((self.state.global_step // eval_steps) + 1) * eval_steps
+            next_eval_global_step = max(next_eval_global_step, int(self.args.eval_delay))
+        else:
+            next_eval_global_step = None
         eval_diag_this_step = eval_diag and (
             self.control.should_evaluate
             or self.state.global_step < 10
@@ -2375,7 +2389,21 @@ class Trainer:
                 f"should_evaluate={self.control.should_evaluate} should_log={self.control.should_log} "
                 f"should_save={self.control.should_save} eval_strategy={self.args.eval_strategy} "
                 f"state.eval_steps={self.state.eval_steps} args.eval_delay={self.args.eval_delay} "
-                f"max_steps={self.state.max_steps}",
+                f"next_eval_global_step={next_eval_global_step} "
+                f"steps_until_next_eval={(next_eval_global_step - self.state.global_step) if next_eval_global_step is not None else 'n/a'} "
+                f"force_eval_every_steps={force_eval_every_steps} max_steps={self.state.max_steps}",
+                flush=True,
+            )
+        if (
+            force_eval_every_steps > 0
+            and self.state.global_step > 0
+            and self.state.global_step % max(1, force_eval_every_steps) == 0
+            and not self.control.should_evaluate
+        ):
+            self.control.should_evaluate = True
+            print(
+                "[PAI XLA EVAL DIAG] forcing evaluation "
+                f"global_step={self.state.global_step} force_eval_every_steps={force_eval_every_steps}",
                 flush=True,
             )
         if debug_mlse_this_step:
