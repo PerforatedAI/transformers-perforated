@@ -1810,16 +1810,6 @@ class Trainer:
             train_dataloader.set_epoch(epoch)
         epoch_iterator = iter(train_dataloader)
 
-        if xla_eval_diag:
-            remaining_update_steps_this_epoch = max(0, num_update_steps_per_epoch - num_update_steps_trained)
-            print(
-                "[PAI XLA EVAL DIAG] epoch start "
-                f"epoch_index={epoch} global_step={self.state.global_step} "
-                f"steps_in_epoch={steps_in_epoch} num_update_steps_per_epoch={num_update_steps_per_epoch} "
-                f"remaining_update_steps_this_epoch={remaining_update_steps_this_epoch}",
-                flush=True,
-            )
-
         # We chunkify the epoch iterator into gradient accumulation steps `n` batches
         remainder = steps_in_epoch % self.args.gradient_accumulation_steps
         if remainder == 0:
@@ -1840,6 +1830,17 @@ class Trainer:
         )
         xla_debug_heartbeat_steps = int(os.environ.get("PAI_XLA_TRAIN_HEARTBEAT_STEPS", "50"))
         xla_eval_diag_steps = int(os.environ.get("PAI_XLA_EVAL_DIAG_STEPS", "25"))
+
+        if xla_eval_diag:
+            remaining_update_steps_this_epoch = max(0, num_update_steps_per_epoch - num_update_steps_trained)
+            print(
+                "[PAI XLA EVAL DIAG] epoch start "
+                f"epoch_index={epoch} global_step={self.state.global_step} "
+                f"steps_in_epoch={steps_in_epoch} num_update_steps_per_epoch={num_update_steps_per_epoch} "
+                f"remaining_update_steps_this_epoch={remaining_update_steps_this_epoch}",
+                flush=True,
+            )
+
         trainingComplete = False
         for update_step in range(num_update_steps_trained, num_update_steps_per_epoch):
             xla_debug_this_step = debug_xla_loop and (
