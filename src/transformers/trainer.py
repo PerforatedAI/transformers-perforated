@@ -2497,8 +2497,22 @@ class Trainer:
 
             if tr_loss_scalar is not None:
                 logs["loss"] = tr_loss_scalar / (self.state.global_step - self._globalstep_last_logged)
+            skip_grad_norm_scalar_sync = (
+                grad_norm is not None
+                and (self.using_perforatedai or self.using_trainium)
+                and is_torch_xla_available()
+                and os.environ.get("PAI_XLA_ALLOW_LOG_GRADNORM_SCALAR_SYNC", "0") != "1"
+            )
             if grad_norm is not None:
-                logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+                if skip_grad_norm_scalar_sync:
+                    if debug_mlse_this_step:
+                        print(
+                            "[PAI XLA DEBUG] skipping grad_norm scalar sync "
+                            "(set PAI_XLA_ALLOW_LOG_GRADNORM_SCALAR_SYNC=1 to force)",
+                            flush=True,
+                        )
+                else:
+                    logs["grad_norm"] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             if learning_rate is not None:
                 logs["learning_rate"] = learning_rate
             else:
