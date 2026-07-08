@@ -1831,6 +1831,7 @@ class Trainer:
         )
         xla_debug_heartbeat_steps = int(os.environ.get("PAI_XLA_TRAIN_HEARTBEAT_STEPS", "50"))
         xla_eval_diag_steps = int(os.environ.get("PAI_XLA_EVAL_DIAG_STEPS", "25"))
+        epoch_ended_early = False
 
         if xla_eval_diag:
             remaining_update_steps_this_epoch = max(0, num_update_steps_per_epoch - num_update_steps_trained)
@@ -2051,13 +2052,15 @@ class Trainer:
                     self.control = self.callback_handler.on_substep_end(self.args, self.state, self.control)
 
                 if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
+                    epoch_ended_early = True
                     break
             if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
+                epoch_ended_early = True
                 break
 
         # PyTorch/XLA relies on the dataloader to insert mark_step each iteration.
         # When we break out of the loop early, we flush the pending graph manually.
-        if is_torch_xla_available():
+        if is_torch_xla_available() and epoch_ended_early:
             xm.mark_step()
 
         if step < 0:
