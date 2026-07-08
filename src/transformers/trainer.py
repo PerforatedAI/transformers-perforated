@@ -1568,6 +1568,30 @@ class Trainer:
         logger.info(f"  Total optimization steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
+        if (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_EVAL_DIAG", "1") == "1"
+        ):
+            next_eval_global_step = None
+            eval_strategy_value = str(self.args.eval_strategy)
+            if eval_strategy_value.endswith("EPOCH"):
+                steps_per_epoch = max(1, num_update_steps_per_epoch)
+                next_eval_global_step = ((self.state.global_step // steps_per_epoch) + 1) * steps_per_epoch
+            elif eval_strategy_value.endswith("STEPS") and self.state.eval_steps > 0:
+                eval_steps = max(1, self.state.eval_steps)
+                next_eval_global_step = ((self.state.global_step // eval_steps) + 1) * eval_steps
+                next_eval_global_step = max(next_eval_global_step, int(self.args.eval_delay))
+
+            print(
+                "[PAI XLA EVAL DIAG] training schedule "
+                f"eval_strategy={self.args.eval_strategy} global_step={self.state.global_step} "
+                f"num_update_steps_per_epoch={num_update_steps_per_epoch} steps_in_epoch={steps_in_epoch} "
+                f"next_eval_global_step={next_eval_global_step} "
+                f"steps_until_next_eval={(next_eval_global_step - self.state.global_step) if next_eval_global_step is not None else 'n/a'}",
+                flush=True,
+            )
+
         if resume_from_checkpoint is not None:
             logger.info(
                 f"  Resuming training from checkpoint with epoch {epochs_trained} and global step {self.state.global_step}"
@@ -1785,6 +1809,16 @@ class Trainer:
         if hasattr(train_dataloader, "set_epoch"):
             train_dataloader.set_epoch(epoch)
         epoch_iterator = iter(train_dataloader)
+
+        if xla_eval_diag:
+            remaining_update_steps_this_epoch = max(0, num_update_steps_per_epoch - num_update_steps_trained)
+            print(
+                "[PAI XLA EVAL DIAG] epoch start "
+                f"epoch_index={epoch} global_step={self.state.global_step} "
+                f"steps_in_epoch={steps_in_epoch} num_update_steps_per_epoch={num_update_steps_per_epoch} "
+                f"remaining_update_steps_this_epoch={remaining_update_steps_this_epoch}",
+                flush=True,
+            )
 
         # We chunkify the epoch iterator into gradient accumulation steps `n` batches
         remainder = steps_in_epoch % self.args.gradient_accumulation_steps
@@ -2032,6 +2066,13 @@ class Trainer:
             )
             self.control.should_training_stop = True
 
+        if xla_eval_diag:
+            print(
+                "[PAI XLA EVAL DIAG] pre on_epoch_end "
+                f"global_step={self.state.global_step} epoch={self.state.epoch:.4f} "
+                f"eval_strategy={self.args.eval_strategy} args.eval_delay={self.args.eval_delay}",
+                flush=True,
+            )
         self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
         if xla_eval_diag:
             print(
@@ -2329,7 +2370,7 @@ class Trainer:
         if eval_diag_this_step:
             print(
                 "[PAI XLA EVAL DIAG] _maybe_log_save_evaluate gate "
-                f"global_step={self.state.global_step} epoch={epoch:.4f} "
+                f"global_step={self.state.global_step} state.epoch={self.state.epoch:.4f} epoch_index={epoch:.4f} "
                 f"should_evaluate={self.control.should_evaluate} should_log={self.control.should_log} "
                 f"should_save={self.control.should_save} eval_strategy={self.args.eval_strategy} "
                 f"state.eval_steps={self.state.eval_steps} args.eval_delay={self.args.eval_delay} "
