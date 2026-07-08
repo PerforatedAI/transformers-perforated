@@ -1799,7 +1799,13 @@ class Trainer:
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
+        xla_eval_diag = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_EVAL_DIAG", "1") == "1"
+        )
         xla_debug_heartbeat_steps = int(os.environ.get("PAI_XLA_TRAIN_HEARTBEAT_STEPS", "50"))
+        xla_eval_diag_steps = int(os.environ.get("PAI_XLA_EVAL_DIAG_STEPS", "25"))
         trainingComplete = False
         for update_step in range(num_update_steps_trained, num_update_steps_per_epoch):
             xla_debug_this_step = debug_xla_loop and (
@@ -1966,6 +1972,23 @@ class Trainer:
                     self.state.global_step += 1
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
+                    if xla_eval_diag and (
+                        self.control.should_evaluate
+                        or self.state.global_step < 10
+                        or (
+                            xla_eval_diag_steps > 0
+                            and (self.state.global_step % max(1, xla_eval_diag_steps) == 0)
+                        )
+                    ):
+                        print(
+                            "[PAI XLA EVAL DIAG] post on_step_end "
+                            f"global_step={self.state.global_step} epoch={self.state.epoch:.4f} "
+                            f"should_evaluate={self.control.should_evaluate} should_log={self.control.should_log} "
+                            f"should_save={self.control.should_save} eval_strategy={self.args.eval_strategy} "
+                            f"state.eval_steps={self.state.eval_steps} args.eval_delay={self.args.eval_delay} "
+                            f"max_steps={self.state.max_steps}",
+                            flush=True,
+                        )
                     if xla_debug_this_step:
                         print(
                             f"[PAI XLA DEBUG] before maybe_log_save_evaluate update_step={update_step} global_step={self.state.global_step}",
@@ -2010,6 +2033,15 @@ class Trainer:
             self.control.should_training_stop = True
 
         self.control = self.callback_handler.on_epoch_end(self.args, self.state, self.control)
+        if xla_eval_diag:
+            print(
+                "[PAI XLA EVAL DIAG] post on_epoch_end "
+                f"global_step={self.state.global_step} epoch={self.state.epoch:.4f} "
+                f"should_evaluate={self.control.should_evaluate} should_log={self.control.should_log} "
+                f"should_save={self.control.should_save} eval_strategy={self.args.eval_strategy} "
+                f"state.eval_steps={self.state.eval_steps} args.eval_delay={self.args.eval_delay}",
+                flush=True,
+            )
         epoch_complete = self._maybe_log_save_evaluate(
             self._tr_loss,
             grad_norm,
@@ -2269,10 +2301,24 @@ class Trainer:
             and is_torch_xla_available()
             and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
         )
+        eval_diag = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_EVAL_DIAG", "1") == "1"
+        )
+        eval_diag_steps = int(os.environ.get("PAI_XLA_EVAL_DIAG_STEPS", "25"))
         debug_mlse_heartbeat = int(os.environ.get("PAI_XLA_MLSE_HEARTBEAT_STEPS", "10"))
         metrics_heartbeat = int(os.environ.get("PAI_XLA_METRICS_HEARTBEAT_STEPS", "0"))
         metrics_full_report = os.environ.get("PAI_XLA_METRICS_FULL", "0") == "1"
         metrics_clear_after_dump = os.environ.get("PAI_XLA_METRICS_CLEAR", "0") == "1"
+        eval_diag_this_step = eval_diag and (
+            self.control.should_evaluate
+            or self.state.global_step < 10
+            or (
+                eval_diag_steps > 0
+                and (self.state.global_step % max(1, eval_diag_steps) == 0)
+            )
+        )
         debug_mlse_this_step = debug_mlse and (
             self.state.global_step < 5
             or (
@@ -2280,6 +2326,16 @@ class Trainer:
                 and (self.state.global_step % max(1, debug_mlse_heartbeat) == 0)
             )
         )
+        if eval_diag_this_step:
+            print(
+                "[PAI XLA EVAL DIAG] _maybe_log_save_evaluate gate "
+                f"global_step={self.state.global_step} epoch={epoch:.4f} "
+                f"should_evaluate={self.control.should_evaluate} should_log={self.control.should_log} "
+                f"should_save={self.control.should_save} eval_strategy={self.args.eval_strategy} "
+                f"state.eval_steps={self.state.eval_steps} args.eval_delay={self.args.eval_delay} "
+                f"max_steps={self.state.max_steps}",
+                flush=True,
+            )
         if debug_mlse_this_step:
             print(
                 "[PAI XLA DEBUG] enter _maybe_log_save_evaluate "
@@ -3082,7 +3138,10 @@ class Trainer:
         xla_eval_debug = (
             self.using_perforatedai
             and is_torch_xla_available()
-            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+            and (
+                os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+                or os.environ.get("PAI_XLA_EVAL_DIAG", "1") == "1"
+            )
         )
         if xla_eval_debug:
             print(
