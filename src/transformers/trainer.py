@@ -984,6 +984,24 @@ class Trainer:
     ) -> DataLoader:
         """Create a [`~torch.utils.data.DataLoader`] from the given dataset."""
 
+        xla_eval_debug = (
+            description == "Evaluation"
+            and self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+        )
+        if xla_eval_debug:
+            try:
+                dataset_len = len(dataset)
+            except Exception:
+                dataset_len = "unknown"
+            print(
+                "[PAI XLA DEBUG] _get_dataloader enter "
+                f"description={description} dataset_type={type(dataset).__name__} dataset_len={dataset_len} "
+                f"batch_size={batch_size} world_size={self.args.world_size}",
+                flush=True,
+            )
+
         data_collator = self.data_collator
         if is_datasets_available() and isinstance(dataset, datasets.Dataset):
             dataset = self._remove_unused_columns(dataset, description=description)
@@ -1018,11 +1036,37 @@ class Trainer:
                     seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
                 )
 
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] _get_dataloader before DataLoader(...) "
+                f"num_workers={dataloader_params.get('num_workers')} "
+                f"pin_memory={dataloader_params.get('pin_memory')} "
+                f"persistent_workers={dataloader_params.get('persistent_workers')} "
+                f"sampler={type(dataloader_params.get('sampler')).__name__ if dataloader_params.get('sampler') is not None else 'None'}",
+                flush=True,
+            )
+
         raw_dataloader = DataLoader(dataset, **dataloader_params)
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] _get_dataloader after DataLoader(...) "
+                f"raw_type={type(raw_dataloader).__name__}",
+                flush=True,
+            )
         if self.using_perforatedai and is_torch_xla_available():
             dataloader = raw_dataloader
         else:
+            if xla_eval_debug:
+                print(
+                    "[PAI XLA DEBUG] _get_dataloader before accelerator.prepare(raw_dataloader)",
+                    flush=True,
+                )
             dataloader = self.accelerator.prepare(raw_dataloader)
+            if xla_eval_debug:
+                print(
+                    "[PAI XLA DEBUG] _get_dataloader after accelerator.prepare(raw_dataloader)",
+                    flush=True,
+                )
 
         # Store the prepared dataloader for subsequent evaluations if using persistent workers.
         if dataloader_key is not None and self.args.dataloader_persistent_workers:
@@ -1030,6 +1074,13 @@ class Trainer:
                 self._eval_dataloaders[dataloader_key] = dataloader
             else:
                 self._eval_dataloaders = {dataloader_key: dataloader}
+
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] _get_dataloader exit "
+                f"description={description} dataloader_type={type(dataloader).__name__}",
+                flush=True,
+            )
 
         return dataloader
 
@@ -3028,6 +3079,19 @@ class Trainer:
             A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
             dictionary also contains the epoch number which comes from the training state.
         """
+        xla_eval_debug = (
+            self.using_perforatedai
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_DEBUG", "0") == "1"
+        )
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] evaluate enter "
+                f"metric_key_prefix={metric_key_prefix} eval_dataset_type={type(eval_dataset).__name__ if eval_dataset is not None else 'None'} "
+                f"global_step={self.state.global_step}",
+                flush=True,
+            )
+
         # handle multiple eval datasets
         override = eval_dataset is not None
         eval_dataset = eval_dataset if override else self.eval_dataset
@@ -3045,12 +3109,30 @@ class Trainer:
         # memory metrics - must set up as early as possible
         self._memory_tracker.start()
 
+        if xla_eval_debug:
+            print("[PAI XLA DEBUG] evaluate before get_eval_dataloader", flush=True)
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] evaluate after get_eval_dataloader "
+                f"dataloader_type={type(eval_dataloader).__name__}",
+                flush=True,
+            )
         if self.is_fsdp_xla_v2_enabled:
+            if xla_eval_debug:
+                print("[PAI XLA DEBUG] evaluate before tpu_spmd_dataloader", flush=True)
             eval_dataloader = tpu_spmd_dataloader(eval_dataloader)
+            if xla_eval_debug:
+                print(
+                    "[PAI XLA DEBUG] evaluate after tpu_spmd_dataloader "
+                    f"dataloader_type={type(eval_dataloader).__name__}",
+                    flush=True,
+                )
 
         start_time = time.time()
 
+        if xla_eval_debug:
+            print("[PAI XLA DEBUG] evaluate before evaluation_loop", flush=True)
         output = self.evaluation_loop(
             eval_dataloader,
             description="Evaluation",
@@ -3060,6 +3142,12 @@ class Trainer:
             ignore_keys=ignore_keys,
             metric_key_prefix=metric_key_prefix,
         )
+        if xla_eval_debug:
+            print(
+                "[PAI XLA DEBUG] evaluate after evaluation_loop "
+                f"num_samples={output.num_samples} metrics_keys={sorted(list(output.metrics.keys()))}",
+                flush=True,
+            )
 
         total_batch_size = self.args.eval_batch_size * self.args.world_size
         if f"{metric_key_prefix}_model_preparation_time" in output.metrics:
@@ -3205,6 +3293,12 @@ class Trainer:
                 "[PAI XLA EVAL TRACE] enabled "
                 f"heartbeat_every={eval_trace_every} slow_step_sec={eval_slow_step_sec} "
                 f"cache={os.environ.get('NEURON_COMPILE_CACHE_URL', '(default)')}",
+                flush=True,
+            )
+        if xla_pai_eval_debug or xla_pai_eval_trace:
+            print(
+                "[PAI XLA DEBUG] evaluation_loop before iter(dataloader) "
+                f"dataloader_type={type(dataloader).__name__} has_length={has_length(dataloader)}",
                 flush=True,
             )
         for step, inputs in enumerate(dataloader):
