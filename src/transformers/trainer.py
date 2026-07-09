@@ -3482,7 +3482,12 @@ class Trainer:
                 f"dataloader_type={type(dataloader).__name__} has_length={has_length(dataloader)}",
                 flush=True,
             )
-        for step, inputs in enumerate(dataloader):
+        dataloader_iter = iter(dataloader)
+        if xla_pai_eval_debug or xla_pai_eval_trace:
+            print("[PAI XLA DEBUG] evaluation_loop after iter(dataloader)", flush=True)
+
+        step = 0
+        while True:
             if max_eval_batches > 0 and step >= max_eval_batches:
                 if xla_pai_eval_debug or xla_pai_eval_trace:
                     print(
@@ -3490,6 +3495,15 @@ class Trainer:
                         flush=True,
                     )
                 break
+
+            if (xla_pai_eval_debug or xla_pai_eval_trace) and step == 0:
+                print("[PAI XLA DEBUG] evaluation_loop before first next(dataloader)", flush=True)
+            try:
+                inputs = next(dataloader_iter)
+            except StopIteration:
+                break
+            if (xla_pai_eval_debug or xla_pai_eval_trace) and step == 0:
+                print("[PAI XLA DEBUG] evaluation_loop after first next(dataloader)", flush=True)
 
             step_start = time.monotonic()
             # Update the observed num examples
@@ -3615,6 +3629,8 @@ class Trainer:
 
                 del losses, logits, labels, inputs
                 torch.cuda.empty_cache()
+
+            step += 1
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
             elif args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
