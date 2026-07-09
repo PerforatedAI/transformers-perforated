@@ -410,6 +410,17 @@ class Trainer:
         self.compute_loss_func = compute_loss_func
         self.using_perforatedai = using_perforatedai
         self.using_trainium = using_trainium
+        self._pai_xla_safe_sync = (
+            (self.using_perforatedai or self.using_trainium)
+            and is_torch_xla_available()
+            and os.environ.get("PAI_XLA_SAFE_SYNC", "1") == "1"
+        )
+
+        if self._pai_xla_safe_sync:
+            # Neuron can fail at sync boundaries when argument wrapping remains tupled.
+            os.environ.setdefault("XLA_PARAMETER_WRAPPING_THREADSHOLD", "65536")
+            # Set the correctly-spelled variant too for forward compatibility.
+            os.environ.setdefault("XLA_PARAMETER_WRAPPING_THRESHOLD", "65536")
         
         # When using PerforatedAI, disable automatic saving to avoid conflicts
         if self.using_perforatedai:
@@ -631,6 +642,10 @@ class Trainer:
 
         self._memory_tracker.stop_and_update_metrics()
 
+    def _use_local_gather_for_pai_xla(self) -> bool:
+        """Use local no-op gather for single-process PAI+XLA to avoid sync-triggered Neuron failures."""
+        return self._pai_xla_safe_sync and self.args.world_size <= 1
+
     def _validate_args(self) -> None:
         """Validate constructor arguments and fail fast on incompatible combinations."""
         args = self.args
@@ -833,6 +848,8 @@ class Trainer:
         self.accelerator = Accelerator(**args)
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
+        if self._use_local_gather_for_pai_xla():
+            self.gather_function = lambda tensor, *args, **kwargs: tensor
 
         if "use_gather_object" in inspect.signature(self.gather_function).parameters:
             self.gather_function = functools.partial(
@@ -3420,6 +3437,14 @@ class Trainer:
             (not self.using_perforatedai and not self.using_trainium)
             or os.environ.get("PAI_XLA_EVAL_MARK_STEP", "0") == "1"
         )
+        skip_eval_gather = (
+            (self.using_perforatedai or self.using_trainium)
+            and is_torch_xla_available()
+            and (
+                self.args.world_size <= 1
+                or os.environ.get("PAI_XLA_SKIP_EVAL_GATHER", "0") == "1"
+            )
+        )
         # Optional safety cap for Trainium eval loops.
         # If env var is unset, use a conservative default on XLA+PAI to avoid
         # long validation compile stalls; users can override explicitly.
@@ -3443,6 +3468,12 @@ class Trainer:
                 "[PAI XLA EVAL TRACE] enabled "
                 f"heartbeat_every={eval_trace_every} slow_step_sec={eval_slow_step_sec} "
                 f"cache={os.environ.get('NEURON_COMPILE_CACHE_URL', '(default)')}",
+                flush=True,
+            )
+        if xla_pai_eval_debug and skip_eval_gather:
+            print(
+                "[PAI XLA DEBUG] skipping eval gather_function on PAI+XLA "
+                f"world_size={self.args.world_size}",
                 flush=True,
             )
         if xla_pai_eval_debug or xla_pai_eval_trace:
@@ -3501,11 +3532,14 @@ class Trainer:
             # Update containers
             gather_start = time.monotonic()
             if losses is not None:
-                losses = self.gather_function(losses.repeat(batch_size))
+                losses = losses.repeat(batch_size)
+                if not skip_eval_gather:
+                    losses = self.gather_function(losses)
                 all_losses.add(losses)
             if inputs_decode is not None:
                 inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
-                inputs_decode = self.gather_function(inputs_decode)
+                if not skip_eval_gather:
+                    inputs_decode = self.gather_function(inputs_decode)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_inputs.add(inputs_decode)
             if labels is not None:
@@ -3515,11 +3549,13 @@ class Trainer:
                 logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
-                logits = self.gather_function(logits)
+                if not skip_eval_gather:
+                    logits = self.gather_function(logits)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_preds.add(logits)
             if labels is not None:
-                labels = self.gather_function(labels)
+                if not skip_eval_gather:
+                    labels = self.gather_function(labels)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_labels.add(labels)
             gather_time = time.monotonic() - gather_start
@@ -3592,6 +3628,8 @@ class Trainer:
 
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
         self.gather_function = self.accelerator.gather_for_metrics
+        if self._use_local_gather_for_pai_xla():
+            self.gather_function = lambda tensor, *args, **kwargs: tensor
 
         # Gather all remaining tensors and put them back on the CPU
         all_losses = all_losses.get_arrays()
