@@ -3565,21 +3565,27 @@ class Trainer:
             if step0_probe and step == 0:
                 print("[PAI XLA DEBUG] evaluation_loop step0 before update containers", flush=True)
             if losses is not None:
-                losses = losses.repeat(batch_size)
+                if skip_eval_gather:
+                    losses = losses.detach().reshape(1)
+                else:
+                    losses = losses.repeat(batch_size)
                 if not skip_eval_gather:
                     losses = self.gather_function(losses)
                 all_losses.add(losses)
             if inputs_decode is not None:
-                inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
+                if not skip_eval_gather:
+                    inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
                 if not skip_eval_gather:
                     inputs_decode = self.gather_function(inputs_decode)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_inputs.add(inputs_decode)
             if labels is not None:
                 # Pad labels here, preparing for preprocess_logits_for_metrics in next logits block.
-                labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                if not skip_eval_gather:
+                    labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
             if logits is not None:
-                logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
+                if not skip_eval_gather:
+                    logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 if not skip_eval_gather:
