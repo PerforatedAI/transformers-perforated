@@ -3416,6 +3416,10 @@ class Trainer:
         eval_metrics_on_slow = os.environ.get("PAI_XLA_EVAL_METRICS_ON_SLOW_STEP", "1") == "1"
         eval_metrics_full_report = os.environ.get("PAI_XLA_EVAL_METRICS_FULL", "0") == "1"
         eval_metrics_clear_after_dump = os.environ.get("PAI_XLA_EVAL_METRICS_CLEAR", "0") == "1"
+        allow_eval_mark_step = (
+            (not self.using_perforatedai and not self.using_trainium)
+            or os.environ.get("PAI_XLA_EVAL_MARK_STEP", "0") == "1"
+        )
         # Optional safety cap for Trainium eval loops.
         # If env var is unset, use a conservative default on XLA+PAI to avoid
         # long validation compile stalls; users can override explicitly.
@@ -3482,9 +3486,17 @@ class Trainer:
 
             mark_step_time = 0.0
             if is_torch_xla_available():
-                mark_step_start = time.monotonic()
-                xm.mark_step()
-                mark_step_time = time.monotonic() - mark_step_start
+                if allow_eval_mark_step:
+                    mark_step_start = time.monotonic()
+                    xm.mark_step()
+                    mark_step_time = time.monotonic() - mark_step_start
+                elif xla_pai_eval_debug and not getattr(self, "_pai_xla_logged_skip_eval_mark_step", False):
+                    print(
+                        "[PAI XLA DEBUG] skipping eval xm.mark_step for PAI+XLA "
+                        "(set PAI_XLA_EVAL_MARK_STEP=1 to force)",
+                        flush=True,
+                    )
+                    self._pai_xla_logged_skip_eval_mark_step = True
 
             # Update containers
             gather_start = time.monotonic()
