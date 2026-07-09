@@ -3630,8 +3630,6 @@ class Trainer:
                 del losses, logits, labels, inputs
                 torch.cuda.empty_cache()
 
-            step += 1
-
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
             elif args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
                 all_losses.to_cpu_and_numpy()
@@ -3641,6 +3639,8 @@ class Trainer:
 
                 del losses, logits, labels, inputs
                 torch.cuda.empty_cache()
+
+            step += 1
 
         # After all calls to `.gather_function`, reset to `gather_for_metrics`:
         self.gather_function = self.accelerator.gather_for_metrics
