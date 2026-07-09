@@ -3470,6 +3470,7 @@ class Trainer:
                 f"cache={os.environ.get('NEURON_COMPILE_CACHE_URL', '(default)')}",
                 flush=True,
             )
+        step0_probe = xla_pai_eval_debug or xla_pai_eval_trace
         if xla_pai_eval_debug and skip_eval_gather:
             print(
                 "[PAI XLA DEBUG] skipping eval gather_function on PAI+XLA "
@@ -3506,8 +3507,15 @@ class Trainer:
                 print("[PAI XLA DEBUG] evaluation_loop after first next(dataloader)", flush=True)
 
             step_start = time.monotonic()
+            if step0_probe and step == 0:
+                print("[PAI XLA DEBUG] evaluation_loop step0 before find_batch_size", flush=True)
             # Update the observed num examples
             observed_batch_size = find_batch_size(inputs)
+            if step0_probe and step == 0:
+                print(
+                    f"[PAI XLA DEBUG] evaluation_loop step0 after find_batch_size observed_batch_size={observed_batch_size}",
+                    flush=True,
+                )
             if observed_batch_size is not None:
                 observed_num_examples += observed_batch_size
                 # For batch samplers, batch_size is not known by the dataloader in advance.
@@ -3522,8 +3530,17 @@ class Trainer:
 
             # Prediction step
             pred_start = time.monotonic()
+            if step0_probe and step == 0:
+                print("[PAI XLA DEBUG] evaluation_loop step0 before prediction_step", flush=True)
             losses, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
             pred_time = time.monotonic() - pred_start
+            if step0_probe and step == 0:
+                print(
+                    f"[PAI XLA DEBUG] evaluation_loop step0 after prediction_step elapsed={pred_time:.2f}s "+
+                    f"losses_none={losses is None} logits_type={type(logits).__name__ if logits is not None else 'None'} "+
+                    f"labels_type={type(labels).__name__ if labels is not None else 'None'}",
+                    flush=True,
+                )
             main_input_name = getattr(self.model, "main_input_name", "input_ids")
             inputs_decode = (
                 self._prepare_input(inputs[main_input_name]) if "inputs" in args.include_for_metrics else None
@@ -3545,6 +3562,8 @@ class Trainer:
 
             # Update containers
             gather_start = time.monotonic()
+            if step0_probe and step == 0:
+                print("[PAI XLA DEBUG] evaluation_loop step0 before update containers", flush=True)
             if losses is not None:
                 losses = losses.repeat(batch_size)
                 if not skip_eval_gather:
@@ -3573,6 +3592,11 @@ class Trainer:
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_labels.add(labels)
             gather_time = time.monotonic() - gather_start
+            if step0_probe and step == 0:
+                print(
+                    f"[PAI XLA DEBUG] evaluation_loop step0 after update containers elapsed={gather_time:.2f}s",
+                    flush=True,
+                )
 
             callback_start = time.monotonic()
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
