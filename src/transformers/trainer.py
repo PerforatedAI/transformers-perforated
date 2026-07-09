@@ -3440,10 +3440,7 @@ class Trainer:
         skip_eval_gather = (
             (self.using_perforatedai or self.using_trainium)
             and is_torch_xla_available()
-            and (
-                self.args.world_size <= 1
-                or os.environ.get("PAI_XLA_SKIP_EVAL_GATHER", "0") == "1"
-            )
+            and os.environ.get("PAI_XLA_SKIP_EVAL_GATHER", "1") == "1"
         )
         # Optional safety cap for Trainium eval loops.
         # If env var is unset, use a conservative default on XLA+PAI to avoid
@@ -3565,38 +3562,74 @@ class Trainer:
             if step0_probe and step == 0:
                 print("[PAI XLA DEBUG] evaluation_loop step0 before update containers", flush=True)
             if losses is not None:
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 before losses transform", flush=True)
                 if skip_eval_gather:
                     losses = losses.detach().reshape(1)
                 else:
                     losses = losses.repeat(batch_size)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after losses transform", flush=True)
                 if not skip_eval_gather:
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 before losses gather", flush=True)
                     losses = self.gather_function(losses)
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 after losses gather", flush=True)
                 all_losses.add(losses)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after all_losses.add", flush=True)
             if inputs_decode is not None:
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 before inputs_decode handling", flush=True)
                 if not skip_eval_gather:
                     inputs_decode = self.accelerator.pad_across_processes(inputs_decode, dim=1, pad_index=-100)
                 if not skip_eval_gather:
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 before inputs_decode gather", flush=True)
                     inputs_decode = self.gather_function(inputs_decode)
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 after inputs_decode gather", flush=True)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_inputs.add(inputs_decode)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after inputs_decode handling", flush=True)
             if labels is not None:
                 # Pad labels here, preparing for preprocess_logits_for_metrics in next logits block.
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 before labels handling", flush=True)
                 if not skip_eval_gather:
                     labels = self.accelerator.pad_across_processes(labels, dim=1, pad_index=-100)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after labels pad", flush=True)
             if logits is not None:
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 before logits handling", flush=True)
                 if not skip_eval_gather:
                     logits = self.accelerator.pad_across_processes(logits, dim=1, pad_index=-100)
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 if not skip_eval_gather:
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 before logits gather", flush=True)
                     logits = self.gather_function(logits)
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 after logits gather", flush=True)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_preds.add(logits)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after logits handling", flush=True)
             if labels is not None:
                 if not skip_eval_gather:
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 before labels gather", flush=True)
                     labels = self.gather_function(labels)
+                    if step0_probe and step == 0:
+                        print("[PAI XLA DEBUG] evaluation_loop step0 after labels gather", flush=True)
                 if not self.args.batch_eval_metrics or description == "Prediction":
                     all_labels.add(labels)
+                if step0_probe and step == 0:
+                    print("[PAI XLA DEBUG] evaluation_loop step0 after labels handling", flush=True)
             gather_time = time.monotonic() - gather_start
             if step0_probe and step == 0:
                 print(
