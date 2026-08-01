@@ -2195,8 +2195,11 @@ class Trainer:
                         restructured = False
                         trainingComplete = False
                 else:
-                    print("validation score name not in score map: ", validation_score_name)
-                    missed_any = True
+                    raise ValueError(
+                        f"Validation score '{validation_score_name}' not found in metrics. "
+                        f"Available metrics: {list(score_map.keys())}"
+                    )
+                    
                 if(missed_any):
                     print("score map: ", score_map)
 
