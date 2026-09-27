@@ -385,7 +385,7 @@ class Trainer:
         optimizers: tuple[torch.optim.Optimizer | None, torch.optim.lr_scheduler.LambdaLR | None] = (None, None),
         optimizer_cls_and_kwargs: tuple[type[torch.optim.Optimizer], dict[str, Any]] | None = None,
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
-        using_perforatedai: bool = False,
+        perforate_model: bool = False,
     ):
         # Init flow:
         #   1. Args & seed               – defaults, determinism
@@ -407,10 +407,10 @@ class Trainer:
             args = TrainingArguments(output_dir=output_dir)
         self.args = args
         self.compute_loss_func = compute_loss_func
-        self.using_perforatedai = using_perforatedai
+        self.perforating_model = perforate_model
         
         # When using PerforatedAI, disable automatic saving to avoid conflicts
-        if self.using_perforatedai:
+        if self.perforating_model:
             self.args.save_strategy = SaveStrategy.NO
         # Seed must be set before instantiating the model when using model
         enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
@@ -1478,7 +1478,7 @@ class Trainer:
             max_steps,
         ) = self.set_initial_training_values(args, train_dataloader)
 
-        if self.using_perforatedai:
+        if self.perforating_model:
             original_max_steps = max_steps
             max_steps = num_update_steps_per_epoch * 100000000  # Effectively infinite
             self._scheduler_max_steps = original_max_steps  # Real steps for LR scheduler
@@ -1524,7 +1524,7 @@ class Trainer:
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
 
-        if self.using_perforatedai and self.optimizer is not None:
+        if self.perforating_model and self.optimizer is not None:
             self.optimizer.zero_grad()
         else:
             model.zero_grad()
@@ -1534,9 +1534,9 @@ class Trainer:
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
 
-        if self.using_perforatedai:
+        if self.perforating_model:
             GPA.pai_tracker.set_optimizer_instance(self.optimizer)
-        for epoch in range(epochs_trained, 100000000 if self.using_perforatedai else num_train_epochs):
+        for epoch in range(epochs_trained, 100000000 if self.perforating_model else num_train_epochs):
             self.control = self.callback_handler.on_epoch_begin(self.args, self.state, self.control)
             trainingComplete = self._run_epoch(
                 model=model,
@@ -1552,7 +1552,7 @@ class Trainer:
                 steps_trained_in_current_epoch=steps_trained_in_current_epoch,
             )
             model = self.model
-            if trainingComplete or ((not self.using_perforatedai) and self.control.should_training_stop):
+            if trainingComplete or ((not self.perforating_model) and self.control.should_training_stop):
                 break
 
         return self._finalize_training(trial, num_train_samples, start_time)
@@ -1820,7 +1820,7 @@ class Trainer:
                         if not isinstance(self.lr_scheduler, (torch.optim.lr_scheduler.ReduceLROnPlateau, GreedyLR)):
                             self.lr_scheduler.step()
 
-                    if self.using_perforatedai and self.optimizer is not None:
+                    if self.perforating_model and self.optimizer is not None:
                         self.optimizer.zero_grad()
                     else:
                         model.zero_grad()
@@ -1842,9 +1842,9 @@ class Trainer:
                 else:
                     self.control = self.callback_handler.on_substep_end(self.args, self.state, self.control)
 
-                if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
+                if trainingComplete or ((not self.perforating_model) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                     break
-            if trainingComplete or ((not self.using_perforatedai) and (self.control.should_epoch_stop or self.control.should_training_stop)):
+            if trainingComplete or ((not self.perforating_model) and (self.control.should_epoch_stop or self.control.should_training_stop)):
                 break
 
         # PyTorch/XLA relies on the dataloader to insert mark_step each iteration.
@@ -2158,7 +2158,7 @@ class Trainer:
                     + "="*80
                 )
 
-            if self.using_perforatedai:
+            if self.perforating_model:
                 # Get metric values
                 eval_accuracy = metrics.get('eval_accuracy')
                 eval_loss = metrics.get('eval_loss')
