@@ -2211,8 +2211,14 @@ class Trainer:
                     self.create_optimizer()
                     self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
                     self.create_scheduler(num_training_steps=self._scheduler_max_steps)
+                    # Reuse the current handler's callbacks: `self.callbacks` lacks the progress/printer callback
+                    # added through add_callback(), so rebuilding from it silently drops all training logs.
                     self.callback_handler = CallbackHandler(
-                        self.callbacks, self.model, self.processing_class, self.optimizer, self.lr_scheduler
+                        self.callback_handler.callbacks,
+                        self.model,
+                        self.processing_class,
+                        self.optimizer,
+                        self.lr_scheduler,
                     )
                     if hasattr(self, '_train_dataloader'):
                         self.callback_handler.train_dataloader = self._train_dataloader
@@ -3565,6 +3571,8 @@ class Trainer:
 
     def _load_best_model(self) -> None:
         """Load the best model found during training based on the tracked metric."""
+        if self.perforating_model:
+            return
         logger.info(f"Loading best model from {self.state.best_model_checkpoint} (score: {self.state.best_metric}).")
         best_model_path = os.path.join(self.state.best_model_checkpoint, WEIGHTS_NAME)
         best_safe_model_path = os.path.join(self.state.best_model_checkpoint, SAFE_WEIGHTS_NAME)
@@ -3908,6 +3916,8 @@ class Trainer:
 
         Will only save from the main process.
         """
+        if self.perforating_model:
+            return
 
         if output_dir is None:
             output_dir = self.args.output_dir
