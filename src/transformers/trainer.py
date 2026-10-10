@@ -412,7 +412,7 @@ class Trainer:
         # When using PerforatedAI, disable automatic saving to avoid conflicts
         if self.using_perforatedai:
             self.args.save_strategy = SaveStrategy.NO
-        # Seed must be set before instantiating the model when using model
+        # Seed must be set before instantiating the model when using model_init
         enable_full_determinism(self.args.seed) if self.args.full_determinism else set_seed(self.args.seed)
 
         # ---- 2. Accelerator & logging ----------------------------------------------
@@ -1523,6 +1523,8 @@ class Trainer:
         self._tr_loss = torch.tensor(0.0, device=args.device)
         self._total_loss_scalar = 0.0
         self._globalstep_last_logged = self.state.global_step
+        self._pai_last_score_total_loss = 0.0
+        self._pai_last_score_step = self.state.global_step
 
         if self.using_perforatedai and self.optimizer is not None:
             self.optimizer.zero_grad()
@@ -1799,7 +1801,7 @@ class Trainer:
                     self.control = self.callback_handler.on_optimizer_step(self.args, self.state, self.control)
 
                     # Check for NaN gradients
-                    if grad_norm is not None and (torch.isnan(torch.tensor(grad_norm)) if not isinstance(grad_norm, torch.Tensor) else torch.isnan(grad_norm)):
+                    if self.using_perforatedai and grad_norm is not None and (torch.isnan(torch.tensor(grad_norm)) if not isinstance(grad_norm, torch.Tensor) else torch.isnan(grad_norm)):
                         logger.warning(
                             "\n" + "="*80 + "\n"
                             f"⚠️  WARNING: NaN GRADIENT DETECTED at step {self.state.global_step}, epoch {epoch + (step + 1) / steps_in_epoch:.2f}\n"
@@ -2148,7 +2150,7 @@ class Trainer:
 
             # Check for NaN in evaluation metrics
             eval_loss = metrics.get('eval_loss')
-            if eval_loss is not None and (torch.isnan(torch.tensor(eval_loss)) if not isinstance(eval_loss, torch.Tensor) else torch.isnan(eval_loss)):
+            if self.using_perforatedai and eval_loss is not None and (torch.isnan(torch.tensor(eval_loss)) if not isinstance(eval_loss, torch.Tensor) else torch.isnan(eval_loss)):
                 logger.warning(
                     "\n" + "="*80 + "\n"
                     f"⚠️  WARNING: NaN EVAL_LOSS DETECTED at step {self.state.global_step}, epoch {self.state.epoch:.2f}\n"
@@ -2159,15 +2161,19 @@ class Trainer:
                 )
 
             if self.using_perforatedai:
-                # Get metric values
-                eval_accuracy = metrics.get('eval_accuracy')
-                eval_loss = metrics.get('eval_loss')
-                train_loss_avg = self._total_loss_scalar / self.state.global_step if self.state.global_step > 0 else 0
+                # Mean train loss since the previous PAI score; tr_loss holds steps not yet drained by logging
+                running_total_loss = self._total_loss_scalar + nested_gather(tr_loss, self.args.parallel_mode).mean().item()
+                steps_since_last_score = self.state.global_step - self._pai_last_score_step
+                train_loss_avg = (
+                    (running_total_loss - self._pai_last_score_total_loss) / steps_since_last_score
+                    if steps_since_last_score > 0
+                    else 0
+                )
+                self._pai_last_score_total_loss = running_total_loss
+                self._pai_last_score_step = self.state.global_step
                 # Map score names to their values and labels
                 score_map = {key: (val, key) for key, val in metrics.items()}
                 score_map['train_loss'] = (train_loss_avg, 'Train Loss')
-
-                extra_scores = GPA.pc.get_library_extra_scores()
 
                 missed_any = False
                 # Process extra scores (without validation score)
@@ -2209,6 +2215,9 @@ class Trainer:
                     self.optimizer = None
                     self.lr_scheduler = None
                     self.create_optimizer()
+                    # accelerate keeps every prepared optimizer: stale ones leak their state and, under fp16,
+                    # clip_grad_norm_ unscales the shared params once per optimizer, shrinking gradients
+                    self.accelerator._optimizers.clear()
                     self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
                     self.create_scheduler(num_training_steps=self._scheduler_max_steps)
                     self.callback_handler = CallbackHandler(
