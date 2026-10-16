@@ -40,6 +40,7 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from itertools import chain
 
@@ -47,6 +48,7 @@ import datasets
 import evaluate
 import torch
 from datasets import load_dataset
+from torch import nn
 
 import transformers
 from transformers import (
@@ -58,10 +60,14 @@ from transformers import (
     DataCollatorForLanguageModeling,
     HfArgumentParser,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
     is_torch_xla_available,
     set_seed,
 )
+from transformers.activations import ACT2FN
+from transformers.data.data_collator import pad_without_fast_tokenizer_warning
+from transformers.models.bert.modeling_bert import BertOutput
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
@@ -83,6 +89,8 @@ BERT_SHORTCUT_NAMES = {
     "mini": "google/bert_uncased_L-4_H-256_A-4",
     "small": "google/bert_uncased_L-4_H-512_A-8",
     "medium": "google/bert_uncased_L-8_H-512_A-8",
+    "base": "bert-base-uncased",
+    "large": "bert-large-uncased",
 }
 
 
@@ -251,6 +259,15 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "Name of the text column in the dataset. Defaults to 'text' if present, otherwise the first column."},
     )
+    fixed_eval_masks: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Mask the evaluation set once using `--seed` instead of re-masking it on every evaluation, so "
+                "unchanged weights always get the same eval loss. Not applied with `--streaming`."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.streaming:
@@ -269,18 +286,249 @@ class DataTrainingArguments:
                     raise ValueError("`validation_file` should be a csv, a json or a txt file.")
 
 
+@dataclass
+class PerforatedAIArguments:
+    """
+    Arguments for the two-stage PerforatedAI protocol: first train a baseline with LR restarts only until restarts stop
+    helping, then add dendrites on top of that saved baseline so that any further gain can be credited to dendrites.
+    """
+
+    pai_stage: str = field(
+        default="dendrites",
+        metadata={
+            "help": (
+                "`baseline`: restart the LR schedule without adding dendrites until restarts stop improving, then save "
+                "the best model to `--output_dir` so it can be passed as `--model_name_or_path` to a `dendrites` run. "
+                "`dendrites`: add dendrites to `--model_name_or_path`."
+            ),
+            "choices": ["baseline", "dendrites"],
+        },
+    )
+    pai_switch_on_schedule_end: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Restart the LR schedule (adding dendrites in the `dendrites` stage) every `--num_train_epochs` epochs, "
+                "when the schedule has decayed to its end, instead of waiting for PAI's `n_epochs_to_switch` epochs "
+                "without improvement while the LR sits at 0."
+            )
+        },
+    )
+    pai_improvement_threshold: float = field(
+        default=0.001,
+        metadata={
+            "help": (
+                "Relative eval loss improvement a full cycle (one LR schedule, plus a new dendrite in the `dendrites` "
+                "stage) needs over the best previous cycle. Training ends at the first cycle that falls short, so the "
+                "same bar decides when the baseline has plateaued and when to stop adding dendrites."
+            )
+        },
+    )
+    pai_max_dendrites: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum number of dendrites to add in the `dendrites` stage (default 3), or maximum number of LR "
+                "restarts in the `baseline` stage (default 100, so the plateau check decides when to stop)."
+            )
+        },
+    )
+    pai_config_file: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "PAI config JSON holding the perforation targets for the `dendrites` stage. Defaults to "
+                "`<model>_<dataset>.json` in the working directory."
+            )
+        },
+    )
+    pai_dendrite_lr_multiplier: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplies the learning rate of dendrite parameters. Their output weights start at 0, so at the "
+                "base learning rate they barely move within a cycle."
+            )
+        },
+    )
+    pai_dendrite_lr_params: str = field(
+        default="all",
+        metadata={
+            "help": (
+                "Which dendrite parameters get `--pai_dendrite_lr_multiplier`: `weights` (the dendrites' copies of "
+                "the wrapped module), `outputs` (the weights connecting dendrites to the neuron and to each other) "
+                "or `all`."
+            ),
+            "choices": ["all", "weights", "outputs"],
+        },
+    )
+    pai_control_extra_ffn_neurons: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Parameter-matched control for dendrites: widen the FFN of each layer in "
+                "`--pai_control_extra_ffn_layers` by this many neurons (513 parameters each for bert-mini) before "
+                "training. Their output weights start at 0 like a dendrite's, and `--pai_dendrite_lr_multiplier` "
+                "applies to them. Use with `--pai_stage baseline`."
+            )
+        },
+    )
+    pai_control_extra_ffn_layers: list[int] = field(
+        default_factory=lambda: [3],
+        metadata={"help": "Encoder layers that get `--pai_control_extra_ffn_neurons`."},
+    )
+
+
+class DataCollatorForMLMWithFixedEvalMasks(DataCollatorForLanguageModeling):
+    """
+    Masks batches on the fly like [`DataCollatorForLanguageModeling`], except for examples that were already masked
+    ahead of time and carry their own `labels`, which are only padded.
+    """
+
+    def torch_call(self, examples):
+        if not (isinstance(examples[0], Mapping) and "labels" in examples[0]):
+            return super().torch_call(examples)
+        labels = [example["labels"] for example in examples]
+        features = [{key: value for key, value in example.items() if key != "labels"} for example in examples]
+        batch = pad_without_fast_tokenizer_warning(
+            self.tokenizer, features, return_tensors="pt", pad_to_multiple_of=self.pad_to_multiple_of
+        )
+        batch["labels"] = torch.full(batch["input_ids"].shape, -100, dtype=torch.long)
+        for i, example_labels in enumerate(labels):
+            if self.tokenizer.padding_side == "left":
+                batch["labels"][i, -len(example_labels) :] = torch.tensor(example_labels)
+            else:
+                batch["labels"][i, : len(example_labels)] = torch.tensor(example_labels)
+        return batch
+
+
+# Parameters PAI adds for dendrites, and the extra neurons of the parameter-matched control.
+# `dendrite_module.parent_module` is a stale copy of the wrapped module, not a dendrite.
+DENDRITE_PARAMETER_MARKERS = {
+    "weights": (".dendrite_module.layers.", ".extra_ffn_up."),
+    "outputs": (".dendrites_to_top.", ".dendrite_module.dendrites_to_dendrites.", ".extra_ffn_down."),
+}
+DENDRITE_PARAMETER_MARKERS["all"] = DENDRITE_PARAMETER_MARKERS["weights"] + DENDRITE_PARAMETER_MARKERS["outputs"]
+
+
+class BertOutputWithExtraFFN(BertOutput):
+    """
+    [`BertOutput`] whose layer has `num_neurons` more FFN neurons, as if `intermediate_size` were larger. Their output
+    weights start at 0, so the model initially computes the same function.
+    """
+
+    def __init__(self, config, num_neurons):
+        super().__init__(config)
+        self.extra_ffn_up = nn.Linear(config.hidden_size, num_neurons)
+        self.extra_ffn_act = ACT2FN[config.hidden_act]
+        self.extra_ffn_down = nn.Linear(num_neurons, config.hidden_size)
+        nn.init.normal_(self.extra_ffn_up.weight, std=config.initializer_range)
+        nn.init.zeros_(self.extra_ffn_up.bias)
+        nn.init.zeros_(self.extra_ffn_down.weight)
+        nn.init.zeros_(self.extra_ffn_down.bias)
+
+    def forward(self, hidden_states, input_tensor):
+        # input_tensor is the attention output, which is also the input of the layer's BertIntermediate.
+        extra = self.extra_ffn_down(self.extra_ffn_act(self.extra_ffn_up(input_tensor)))
+        hidden_states = self.dropout(self.dense(hidden_states) + extra)
+        return self.LayerNorm(hidden_states + input_tensor)
+
+
+class PAITrainer(Trainer):
+    """[`Trainer`] that can train dendrite parameters with a larger learning rate than the rest of the model."""
+
+    def __init__(self, *args, dendrite_lr_multiplier=1.0, dendrite_lr_params="all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dendrite_lr_multiplier = dendrite_lr_multiplier
+        self.dendrite_lr_markers = DENDRITE_PARAMETER_MARKERS[dendrite_lr_params]
+
+    def create_optimizer(self, model=None):
+        if self.optimizer is not None or self.dendrite_lr_multiplier == 1.0:
+            return super().create_optimizer(model)
+        opt_model = self.model if model is None else model
+        decay_parameters = self.get_decay_parameter_names(opt_model)
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args, opt_model)
+        groups = {}
+        for name, param in opt_model.named_parameters():
+            if param.requires_grad:
+                is_main = not any(marker in name for marker in self.dendrite_lr_markers)
+                groups.setdefault((is_main, name in decay_parameters), []).append(param)
+        # Dendrite groups go first because PAI records the learning rate of the last parameter group.
+        self.optimizer = optimizer_cls(
+            [
+                {
+                    "params": params,
+                    "weight_decay": self.args.weight_decay if decays else 0.0,
+                    "lr": optimizer_kwargs["lr"] * (1.0 if is_main else self.dendrite_lr_multiplier),
+                }
+                for (is_main, decays), params in sorted(groups.items())
+            ],
+            **optimizer_kwargs,
+        )
+        return self.optimizer
+
+
+class PAICyclePlateauCallback(TrainerCallback):
+    """
+    Ends PAI training at the first cycle whose best eval loss beats the best of all previous cycles by less than
+    `min_improvement` (relative), by capping `max_dendrites` right before PAI handles the end of that cycle.
+
+    PAI's own improvement threshold is also applied between the epochs of a cycle, so a cycle whose last epoch only
+    slightly beats its earlier epochs would be rejected even if it clearly beat the previous best. PAI's threshold is
+    therefore set to 0 and the plateau is checked here on whole cycles instead. Requires `DOING_FIXED_SWITCH`.
+    """
+
+    def __init__(self, min_improvement):
+        self.min_improvement = min_improvement
+        self.best_before_cycle = None
+        self.cycle_best = None
+        self.training_ended = False
+
+    def on_train_end(self, args, state, control, **kwargs):
+        # Evaluations after training are not part of any cycle.
+        self.training_ended = True
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if self.training_ended or metrics is None or "eval_loss" not in metrics:
+            return
+        score = metrics["eval_loss"]
+        self.cycle_best = score if self.cycle_best is None else min(self.cycle_best, score)
+        # Same check PAI's switch_time() does for DOING_FIXED_SWITCH when this score is added right after this callback.
+        tracker_vars = GPA.pai_tracker.member_vars
+        last_switch = tracker_vars["switch_epochs"][-1] if tracker_vars["switch_epochs"] else 0
+        if tracker_vars["num_epochs_run"] - last_switch < GPA.pc.get_n_fixed_switch_num():
+            return
+        if self.best_before_cycle is not None:
+            improvement = (self.best_before_cycle - self.cycle_best) / self.best_before_cycle
+            logger.info(
+                f"PAI cycle {tracker_vars['num_dendrites_added']} ended with best eval_loss {self.cycle_best:.6f}, "
+                f"{improvement:.4%} better than the previous best {self.best_before_cycle:.6f}"
+            )
+            if improvement < self.min_improvement:
+                logger.info(f"Improvement is below {self.min_improvement:.4%}, ending PAI training after this cycle")
+                # PAI finishes and reloads its best model instead of restarting once this many dendrites are added.
+                GPA.pc.set_max_dendrites(tracker_vars["num_dendrites_added"])
+        else:
+            logger.info(f"PAI cycle 0 ended with best eval_loss {self.cycle_best:.6f}")
+        if self.best_before_cycle is None or self.cycle_best < self.best_before_cycle:
+            self.best_before_cycle = self.cycle_best
+        self.cycle_best = None
+
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, PerforatedAIArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, pai_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, pai_args = parser.parse_args_into_dataclasses()
 
     # Setup logging
     logging.basicConfig(
@@ -448,23 +696,75 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
+    if pai_args.pai_control_extra_ffn_neurons:
+        for layer_index in pai_args.pai_control_extra_ffn_layers:
+            layer = model.bert.encoder.layer[layer_index]
+            output = BertOutputWithExtraFFN(config, pai_args.pai_control_extra_ffn_neurons)
+            output.load_state_dict(layer.output.state_dict(), strict=False)
+            layer.output = output.to(layer.output.dense.weight.dtype)
+        logger.info(
+            f"Added {pai_args.pai_control_extra_ffn_neurons} FFN neurons to layers {pai_args.pai_control_extra_ffn_layers}"
+            f", {sum(p.numel() for p in model.parameters())} parameters in total"
+        )
+
     # PerforatedAI configuration
-    GPA.pc.library_validation_score = "eval_loss"
-    GPA.pc.set_testing_dendrite_capacity(True)
+    doing_pai = pai_args.pai_stage == "dendrites"
+    GPA.pc.set_library_validation_score("eval_loss")
+    GPA.pc.set_library_extra_scores(["train_loss"])
+    GPA.pc.set_library_extra_scores_without_graphing(["eval_perplexity", "eval_accuracy"])
+    # With doing_pai=False each "dendrite" is an LR restart, so this also caps the number of baseline restarts.
+    if pai_args.pai_max_dendrites is not None:
+        GPA.pc.set_max_dendrites(pai_args.pai_max_dendrites)
+    else:
+        GPA.pc.set_max_dendrites(3 if doing_pai else 100)
+    if pai_args.pai_switch_on_schedule_end:
+        if training_args.do_train and (
+            training_args.eval_strategy != "epoch" or not float(training_args.num_train_epochs).is_integer()
+        ):
+            raise ValueError(
+                "--pai_switch_on_schedule_end requires --eval_strategy epoch and an integer --num_train_epochs"
+            )
+        # The trainer builds every LR schedule to last num_train_epochs, so switch as soon as it reaches the end.
+        GPA.pc.set_switch_mode(GPA.pc.DOING_FIXED_SWITCH)
+        GPA.pc.set_n_fixed_switch_num(int(training_args.num_train_epochs))
+        # Let PAI keep every improvement and apply the threshold to whole cycles in PAICyclePlateauCallback.
+        GPA.pc.set_improvement_threshold([0.0])
+    else:
+        # PAI indexes a list threshold by the number of cycles so far and the default decays to 0, which would let
+        # tiny gains keep the baseline restarting forever, so use a single value.
+        GPA.pc.set_improvement_threshold([pai_args.pai_improvement_threshold])
+    GPA.pc.set_testing_dendrite_capacity(False)
     GPA.pc.set_module_names_to_perforate(["Linear"])
     GPA.pc.set_output_dimensions([-1, -1, 0])  # [batch, sequence, features]
-    _model_label = model_args.model_shortcut or model_args.model_name_or_path.replace('/', '_')
+    if not doing_pai:
+        # No dendrites are added, so the perforation targets don't matter and the interactive selection is skipped.
+        GPA.pc.set_configuration_confirmed(True)
+        GPA.pc.set_unwrapped_modules_confirmed(True)
+        # Don't retry a restart that didn't improve: without dendrites PAI's retry path records a single switch epoch,
+        # which breaks its best_arch_scores bookkeeping. The first cycle of the `dendrites` stage is another restart
+        # from the same weights without dendrites, so it double-checks the plateau.
+        GPA.pc.set_max_dendrite_tries(1)
+    if model_args.model_shortcut:
+        _model_label = model_args.model_shortcut
+    elif os.path.isdir(model_args.model_name_or_path):
+        _model_label = os.path.basename(os.path.normpath(model_args.model_name_or_path))
+    else:
+        _model_label = model_args.model_name_or_path.replace('/', '_')
     _pai_config_name = (
         f"{_model_label}"
         f"_{(data_args.dataset_name or 'custom').replace('/', '_')}"
     )
-    _pai_save_name = f"{_pai_config_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # The process id keeps runs launched in the same second from sharing a folder and loading each other's models.
+    _pai_save_name = (
+        f"{_pai_config_name}_{pai_args.pai_stage}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    )
     model = UPA.perforate_model(
         model,
         save_name=_pai_save_name,
         maximizing_score=False,
         making_graphs=True,
-        config_file=f"{_pai_config_name}.json"
+        config_file=(pai_args.pai_config_file or f"{_pai_config_name}.json") if doing_pai else None,
+        doing_pai=doing_pai,
     )
 
     # Preprocessing the datasets.
@@ -633,14 +933,51 @@ def main():
     # Data collator
     # This one will take care of randomly masking the tokens.
     pad_to_multiple_of_8 = data_args.line_by_line and training_args.fp16 and not data_args.pad_to_max_length
-    data_collator = DataCollatorForLanguageModeling(
+    data_collator = DataCollatorForMLMWithFixedEvalMasks(
         tokenizer=tokenizer,
         mlm_probability=data_args.mlm_probability,
         pad_to_multiple_of=8 if pad_to_multiple_of_8 else None,
     )
 
+    if training_args.do_eval and data_args.fixed_eval_masks and not data_args.streaming:
+        # Re-masking on every evaluation makes the eval loss of unchanged weights jump around by more than the gains
+        # PAI is trying to detect, so draw the masks once. The same seed gives both PAI stages the same eval masks.
+        eval_masker = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
+        eval_masker.generator = torch.Generator().manual_seed(training_args.seed)
+
+        def mask_eval_examples(examples):
+            masked_input_ids, labels = [], []
+            for input_ids, special_tokens_mask in zip(examples["input_ids"], examples["special_tokens_mask"]):
+                example_input_ids, example_labels = eval_masker.torch_mask_tokens(
+                    torch.tensor([input_ids]), special_tokens_mask=torch.tensor([special_tokens_mask])
+                )
+                masked_input_ids.append(example_input_ids[0].tolist())
+                labels.append(example_labels[0].tolist())
+            return {"input_ids": masked_input_ids, "labels": labels}
+
+        eval_dataset = eval_dataset.map(
+            mask_eval_examples,
+            batched=True,
+            remove_columns=["special_tokens_mask"],
+            load_from_cache_file=False,
+            keep_in_memory=True,
+            desc="Masking evaluation set once",
+        )
+
+    class PAIMetricsCallback(TrainerCallback):
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            if metrics is None:
+                return
+            if "eval_loss" in metrics:
+                try:
+                    metrics["eval_perplexity"] = math.exp(metrics["eval_loss"])
+                except OverflowError:
+                    metrics["eval_perplexity"] = float("inf")
+
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = PAITrainer(
+        dendrite_lr_multiplier=pai_args.pai_dendrite_lr_multiplier,
+        dendrite_lr_params=pai_args.pai_dendrite_lr_params,
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -652,6 +989,8 @@ def main():
         if training_args.do_eval and not is_torch_xla_available()
         else None,
         perforate_model=True,
+        callbacks=[PAIMetricsCallback()]
+        + ([PAICyclePlateauCallback(pai_args.pai_improvement_threshold)] if pai_args.pai_switch_on_schedule_end else []),
     )
 
     # Training
@@ -661,6 +1000,21 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
+        if not doing_pai and not pai_args.pai_control_extra_ffn_neurons and trainer.is_world_process_zero():
+            # trainer.save_model() is a no-op while perforating, and PAI's own saves keep its module wrappers. Save
+            # the best baseline as a plain checkpoint so a `dendrites` run can load it with --model_name_or_path.
+            # PAI wraps converted modules, which inserts `.main_module` into their parameter names.
+            pai_state_dict = {
+                key.replace(".main_module", ""): value
+                for key, value in trainer.accelerator.unwrap_model(trainer.model).state_dict().items()
+            }
+            baseline_model = AutoModelForMaskedLM.from_config(config, trust_remote_code=model_args.trust_remote_code)
+            baseline_model.load_state_dict(
+                {key: pai_state_dict[key] for key in baseline_model.state_dict()}, strict=True
+            )
+            baseline_model.save_pretrained(training_args.output_dir)
+            tokenizer.save_pretrained(training_args.output_dir)
+            logger.info(f"Saved PAI baseline to {training_args.output_dir}")
         metrics = train_result.metrics
 
         max_train_samples = (
