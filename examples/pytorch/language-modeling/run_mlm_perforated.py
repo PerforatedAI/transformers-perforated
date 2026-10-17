@@ -48,7 +48,6 @@ import datasets
 import evaluate
 import torch
 from datasets import load_dataset
-from torch import nn
 
 import transformers
 from transformers import (
@@ -65,9 +64,7 @@ from transformers import (
     is_torch_xla_available,
     set_seed,
 )
-from transformers.activations import ACT2FN
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
-from transformers.models.bert.modeling_bert import BertOutput
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 
@@ -328,8 +325,18 @@ class PerforatedAIArguments:
         default=None,
         metadata={
             "help": (
-                "Maximum number of dendrites to add in the `dendrites` stage (default 3), or maximum number of LR "
+                "Maximum number of dendrites to add in the `dendrites` stage (default 6), or maximum number of LR "
                 "restarts in the `baseline` stage (default 100, so the plateau check decides when to stop)."
+            )
+        },
+    )
+    pai_dendrite_top_layers: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Add dendrites to the Linear layers of this many top encoder layers and to the MLM head's transform "
+                "dense; all other layers are left unchanged. Dendrites closest to the output give the most gain per "
+                "added parameter. Ignored when `--pai_config_file` is given."
             )
         },
     )
@@ -337,45 +344,19 @@ class PerforatedAIArguments:
         default=None,
         metadata={
             "help": (
-                "PAI config JSON holding the perforation targets for the `dendrites` stage. Defaults to "
-                "`<model>_<dataset>.json` in the working directory."
+                "PAI config JSON with custom perforation targets for the `dendrites` stage, instead of "
+                "`--pai_dendrite_top_layers`."
             )
         },
     )
     pai_dendrite_lr_multiplier: float = field(
-        default=1.0,
+        default=30.0,
         metadata={
             "help": (
-                "Multiplies the learning rate of dendrite parameters. Their output weights start at 0, so at the "
-                "base learning rate they barely move within a cycle."
+                "Multiplies the learning rate of dendrite parameters. Their output weights start at 0, so at a "
+                "fine-tuning learning rate they barely move within a cycle and the dendrites add nothing."
             )
         },
-    )
-    pai_dendrite_lr_params: str = field(
-        default="all",
-        metadata={
-            "help": (
-                "Which dendrite parameters get `--pai_dendrite_lr_multiplier`: `weights` (the dendrites' copies of "
-                "the wrapped module), `outputs` (the weights connecting dendrites to the neuron and to each other) "
-                "or `all`."
-            ),
-            "choices": ["all", "weights", "outputs"],
-        },
-    )
-    pai_control_extra_ffn_neurons: int = field(
-        default=0,
-        metadata={
-            "help": (
-                "Parameter-matched control for dendrites: widen the FFN of each layer in "
-                "`--pai_control_extra_ffn_layers` by this many neurons (513 parameters each for bert-mini) before "
-                "training. Their output weights start at 0 like a dendrite's, and `--pai_dendrite_lr_multiplier` "
-                "applies to them. Use with `--pai_stage baseline`."
-            )
-        },
-    )
-    pai_control_extra_ffn_layers: list[int] = field(
-        default_factory=lambda: [3],
-        metadata={"help": "Encoder layers that get `--pai_control_extra_ffn_neurons`."},
     )
 
 
@@ -402,45 +383,20 @@ class DataCollatorForMLMWithFixedEvalMasks(DataCollatorForLanguageModeling):
         return batch
 
 
-# Parameters PAI adds for dendrites, and the extra neurons of the parameter-matched control.
-# `dendrite_module.parent_module` is a stale copy of the wrapped module, not a dendrite.
-DENDRITE_PARAMETER_MARKERS = {
-    "weights": (".dendrite_module.layers.", ".extra_ffn_up."),
-    "outputs": (".dendrites_to_top.", ".dendrite_module.dendrites_to_dendrites.", ".extra_ffn_down."),
-}
-DENDRITE_PARAMETER_MARKERS["all"] = DENDRITE_PARAMETER_MARKERS["weights"] + DENDRITE_PARAMETER_MARKERS["outputs"]
-
-
-class BertOutputWithExtraFFN(BertOutput):
-    """
-    [`BertOutput`] whose layer has `num_neurons` more FFN neurons, as if `intermediate_size` were larger. Their output
-    weights start at 0, so the model initially computes the same function.
-    """
-
-    def __init__(self, config, num_neurons):
-        super().__init__(config)
-        self.extra_ffn_up = nn.Linear(config.hidden_size, num_neurons)
-        self.extra_ffn_act = ACT2FN[config.hidden_act]
-        self.extra_ffn_down = nn.Linear(num_neurons, config.hidden_size)
-        nn.init.normal_(self.extra_ffn_up.weight, std=config.initializer_range)
-        nn.init.zeros_(self.extra_ffn_up.bias)
-        nn.init.zeros_(self.extra_ffn_down.weight)
-        nn.init.zeros_(self.extra_ffn_down.bias)
-
-    def forward(self, hidden_states, input_tensor):
-        # input_tensor is the attention output, which is also the input of the layer's BertIntermediate.
-        extra = self.extra_ffn_down(self.extra_ffn_act(self.extra_ffn_up(input_tensor)))
-        hidden_states = self.dropout(self.dense(hidden_states) + extra)
-        return self.LayerNorm(hidden_states + input_tensor)
+# Parameters PAI adds for dendrites. `dendrite_module.parent_module` is a stale copy of the wrapped module, not a dendrite.
+DENDRITE_PARAMETER_MARKERS = (
+    ".dendrite_module.layers.",
+    ".dendrites_to_top.",
+    ".dendrite_module.dendrites_to_dendrites.",
+)
 
 
 class PAITrainer(Trainer):
     """[`Trainer`] that can train dendrite parameters with a larger learning rate than the rest of the model."""
 
-    def __init__(self, *args, dendrite_lr_multiplier=1.0, dendrite_lr_params="all", **kwargs):
+    def __init__(self, *args, dendrite_lr_multiplier=1.0, **kwargs):
         super().__init__(*args, **kwargs)
         self.dendrite_lr_multiplier = dendrite_lr_multiplier
-        self.dendrite_lr_markers = DENDRITE_PARAMETER_MARKERS[dendrite_lr_params]
 
     def create_optimizer(self, model=None):
         if self.optimizer is not None or self.dendrite_lr_multiplier == 1.0:
@@ -451,7 +407,7 @@ class PAITrainer(Trainer):
         groups = {}
         for name, param in opt_model.named_parameters():
             if param.requires_grad:
-                is_main = not any(marker in name for marker in self.dendrite_lr_markers)
+                is_main = not any(marker in name for marker in DENDRITE_PARAMETER_MARKERS)
                 groups.setdefault((is_main, name in decay_parameters), []).append(param)
         # Dendrite groups go first because PAI records the learning rate of the last parameter group.
         self.optimizer = optimizer_cls(
@@ -696,17 +652,6 @@ def main():
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
-    if pai_args.pai_control_extra_ffn_neurons:
-        for layer_index in pai_args.pai_control_extra_ffn_layers:
-            layer = model.bert.encoder.layer[layer_index]
-            output = BertOutputWithExtraFFN(config, pai_args.pai_control_extra_ffn_neurons)
-            output.load_state_dict(layer.output.state_dict(), strict=False)
-            layer.output = output.to(layer.output.dense.weight.dtype)
-        logger.info(
-            f"Added {pai_args.pai_control_extra_ffn_neurons} FFN neurons to layers {pai_args.pai_control_extra_ffn_layers}"
-            f", {sum(p.numel() for p in model.parameters())} parameters in total"
-        )
-
     # PerforatedAI configuration
     doing_pai = pai_args.pai_stage == "dendrites"
     GPA.pc.set_library_validation_score("eval_loss")
@@ -716,7 +661,7 @@ def main():
     if pai_args.pai_max_dendrites is not None:
         GPA.pc.set_max_dendrites(pai_args.pai_max_dendrites)
     else:
-        GPA.pc.set_max_dendrites(3 if doing_pai else 100)
+        GPA.pc.set_max_dendrites(6 if doing_pai else 100)
     if pai_args.pai_switch_on_schedule_end:
         if training_args.do_train and (
             training_args.eval_strategy != "epoch" or not float(training_args.num_train_epochs).is_integer()
@@ -744,6 +689,18 @@ def main():
         # which breaks its best_arch_scores bookkeeping. The first cycle of the `dendrites` stage is another restart
         # from the same weights without dendrites, so it double-checks the plateau.
         GPA.pc.set_max_dendrite_tries(1)
+    elif pai_args.pai_config_file is None:
+        if not hasattr(model, "bert"):
+            raise ValueError("--pai_dendrite_top_layers only supports BERT models, pass --pai_config_file instead")
+        # PAI adds dendrites to every Linear it doesn't track. The decoder is tied to the word embeddings and a
+        # dendrite copy of it would add vocab_size x hidden_size parameters.
+        num_layers_without_dendrites = max(config.num_hidden_layers - pai_args.pai_dendrite_top_layers, 0)
+        GPA.pc.set_module_names_to_track(["BertEmbeddings", "LayerNorm"])
+        GPA.pc.set_module_ids_to_track(
+            [".cls.predictions.decoder"] + [f".bert.encoder.layer.{i}" for i in range(num_layers_without_dendrites)]
+        )
+        GPA.pc.set_parameter_ids_to_track([".cls.predictions.bias"])
+        GPA.pc.set_configuration_confirmed(True)
     if model_args.model_shortcut:
         _model_label = model_args.model_shortcut
     elif os.path.isdir(model_args.model_name_or_path):
@@ -763,7 +720,7 @@ def main():
         save_name=_pai_save_name,
         maximizing_score=False,
         making_graphs=True,
-        config_file=(pai_args.pai_config_file or f"{_pai_config_name}.json") if doing_pai else None,
+        config_file=pai_args.pai_config_file if doing_pai else None,
         doing_pai=doing_pai,
     )
 
@@ -977,7 +934,6 @@ def main():
     # Initialize our Trainer
     trainer = PAITrainer(
         dendrite_lr_multiplier=pai_args.pai_dendrite_lr_multiplier,
-        dendrite_lr_params=pai_args.pai_dendrite_lr_params,
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -1000,7 +956,7 @@ def main():
             checkpoint = training_args.resume_from_checkpoint
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
         trainer.save_model()  # Saves the tokenizer too for easy upload
-        if not doing_pai and not pai_args.pai_control_extra_ffn_neurons and trainer.is_world_process_zero():
+        if not doing_pai and trainer.is_world_process_zero():
             # trainer.save_model() is a no-op while perforating, and PAI's own saves keep its module wrappers. Save
             # the best baseline as a plain checkpoint so a `dendrites` run can load it with --model_name_or_path.
             # PAI wraps converted modules, which inserts `.main_module` into their parameter names.
